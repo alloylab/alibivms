@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2b5876"/>
+      <stop offset="1" stop-color="#14263a"/>
+    </linearGradient>
+    <linearGradient id="lens" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#7fd3ff"/>
+      <stop offset="1" stop-color="#2a7fc0"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="112" height="112" rx="24" fill="url(#bg)"/>
+  <rect x="8" y="8" width="112" height="112" rx="24" fill="none" stroke="#ffffff" stroke-opacity=".08" stroke-width="2"/>
+  <!-- Video wall -->
+  <rect x="22" y="24" width="38" height="28" rx="5" fill="#ffffff" fill-opacity=".16"/>
+  <rect x="68" y="24" width="38" height="28" rx="5" fill="#ffffff" fill-opacity=".16"/>
+  <rect x="22" y="58" width="38" height="28" rx="5" fill="#ffffff" fill-opacity=".16"/>
+  <rect x="68" y="58" width="38" height="28" rx="5" fill="#ffffff" fill-opacity=".10"/>
+  <!-- Camera eye over the wall -->
+  <circle cx="64" cy="58" r="23" fill="#0d1b2a"/>
+  <circle cx="64" cy="58" r="17" fill="url(#lens)"/>
+  <circle cx="64" cy="58" r="8" fill="#0d1b2a"/>
+  <circle cx="58.5" cy="52.5" r="3.5" fill="#ffffff" fill-opacity=".85"/>
+  <!-- Recording dot and timeline -->
+  <circle cx="98" cy="30" r="4" fill="#e5484d"/>
+  <rect x="22" y="96" width="84" height="6" rx="3" fill="#ffffff" fill-opacity=".14"/>
+  <rect x="22" y="96" width="50" height="6" rx="3" fill="#7fd3ff"/>
+  <circle cx="72" cy="99" r="5" fill="#ffffff"/>
+</svg>

@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Alibi VMS
+GenericName=Video Management
+Comment=Live view, playback and clip download for Alibi NVRs
+Exec=alibi-vms
+Icon=io.github.alloylab.alibivms
+Terminal=false
+Categories=AudioVideo;Video;Security;
+Keywords=NVR;CCTV;camera;surveillance;Star4Live;
+StartupWMClass=io.github.alloylab.alibivms

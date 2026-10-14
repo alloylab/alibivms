@@ -1,0 +1,17 @@
+[package]
+name = "lapi"
+description = "Client for the Uniview/Alibi NVR LAPI HTTP API"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+reqwest.workspace = true
+tracing.workspace = true
+md5.workspace = true
+rand.workspace = true
+url = "2"

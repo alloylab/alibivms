@@ -1,0 +1,28 @@
+.video-grid { background: #000; padding: 2px; }
+.tile { background: #07090b; }
+.tile-bar { background: linear-gradient(rgba(0,0,0,.75), rgba(0,0,0,0)); padding: 4px 6px 14px; color: white; }
+.tile-caption { margin: 0 0 8px 8px; padding: 2px 8px; border-radius: 4px; background: rgba(0,0,0,.55); color: white; }
+.tile-name { font-weight: 600; }
+.tile-btn { color: white; min-height: 22px; min-width: 22px; padding: 0 6px; font-size: 0.85em; }
+.tile-status { background: rgba(0,0,0,.6); color: white; padding: 6px 12px; border-radius: 6px; }
+.tile-status.error { color: #ff7b72; }
+.toolbar { padding: 6px 12px; border-bottom: 1px solid alpha(currentColor, .12); }
+.timeline-box { padding: 6px 12px 8px; border-top: 1px solid alpha(currentColor, .12); }
+.clock { font-size: 1.1em; }
+.dot { border-radius: 50%; min-width: 8px; min-height: 8px; background: alpha(currentColor, .4); }
+.dot.on { background: #2ec27e; }
+.thumb { border-radius: 4px; background: alpha(currentColor, .08); }
+.dot.off { background: #e01b24; }
+row.chosen { background: alpha(@accent_bg_color, .25); }
+.status-pill { font-size: 0.8em; padding: 1px 8px; border-radius: 9px; border: 1px solid alpha(currentColor, .3); }
+.status-ready { color: @success_color; border-color: @success_color; }
+.status-failed, .status-cancelled { color: @error_color; border-color: @error_color; }
+.status-running, .status-queued { color: @warning_color; border-color: @warning_color; }
+.tile-empty { opacity: 0.4; }
+.tile-badge { font-size: 0.75em; padding: 1px 6px; border-radius: 4px; background: rgba(255,255,255,.15); color: white; }
+.tile-site { font-size: 0.75em; opacity: 0.75; }
+.live-badge { font-size: 0.7em; font-weight: 700; color: white; background: #c01c28; padding: 1px 6px; border-radius: 4px; }
+.zoom-badge { font-size: 0.75em; font-weight: 600; min-height: 0; min-width: 0; padding: 1px 6px; border-radius: 4px; background: rgba(0,0,0,.6); color: white; }
+.alert-badge { font-size: 0.65em; font-weight: 700; color: white; background: #c01c28; border-radius: 8px; min-width: 14px; padding: 0 3px; margin: -6px -8px 0 0; }
+.clip-thumb { border-radius: 6px; background: alpha(currentColor, .08); }
+.clip-badge { font-size: 0.75em; font-weight: 600; margin: 4px; padding: 0 5px; border-radius: 4px; background: rgba(0,0,0,.7); color: white; }
