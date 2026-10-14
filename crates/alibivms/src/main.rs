@@ -12,6 +12,7 @@ mod rtsp_proxy;
 mod sites;
 mod thumbnails;
 mod ui;
+mod update;
 mod video;
 
 use adw::prelude::*;

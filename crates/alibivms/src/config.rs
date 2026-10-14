@@ -104,6 +104,8 @@ pub struct Config {
     pub thumbnails: bool,
     /// Cameras with "Alert on motion" on: site id → channels.
     pub motion_alerts: BTreeMap<String, BTreeSet<u32>>,
+    /// Ask GitHub once a day whether a newer release is out.
+    pub check_updates: bool,
 }
 
 impl Default for Config {
@@ -123,6 +125,7 @@ impl Default for Config {
             favorites: Vec::new(),
             motion_alerts: BTreeMap::new(),
             tour_secs: 30,
+            check_updates: true,
             thumbnails: true,
         }
     }
