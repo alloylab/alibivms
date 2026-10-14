@@ -1,5 +1,9 @@
+// Release builds on Windows are GUI apps: no console window behind the main one.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod app;
 mod audit;
+mod bundle;
 mod cloud_media;
 mod config;
 mod download;
@@ -14,6 +18,7 @@ use adw::prelude::*;
 use tracing_subscriber::EnvFilter;
 
 fn main() -> gtk::glib::ExitCode {
+    bundle::setup();
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .init();

@@ -177,7 +177,7 @@ impl Thumbnails {
 
 fn cache_path(cam: &Cam) -> PathBuf {
     let site: String = cam.site.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect();
-    dirs::cache_dir().unwrap_or_else(|| ".".into()).join("alibi-vms/thumbs").join(site).join(format!("{}.png", cam.channel))
+    dirs::cache_dir().unwrap_or_else(|| ".".into()).join("alibivms/thumbs").join(site).join(format!("{}.png", cam.channel))
 }
 
 /// One decoded RGBA frame.

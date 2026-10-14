@@ -169,7 +169,7 @@ fn export_settings(app: &Rc<App>) {
         let with_passwords = passwords.is_active();
         let day = glib::DateTime::now_local().ok().and_then(|d| d.format("%Y-%m-%d").ok()).map(|s| s.to_string()).unwrap_or_default();
         let filters = json_filters();
-        let fd = gtk::FileDialog::builder().title("Export settings").initial_name(format!("alibi-vms-config-{day}.json")).filters(&filters).modal(true).build();
+        let fd = gtk::FileDialog::builder().title("Export settings").initial_name(format!("alibivms-config-{day}.json")).filters(&filters).modal(true).build();
         let a2 = a.clone();
         fd.save(Some(&a.window), gio::Cancellable::NONE, move |r| {
             let Some(path) = r.ok().and_then(|f| f.path()) else { return };

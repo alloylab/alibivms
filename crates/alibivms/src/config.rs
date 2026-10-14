@@ -1,4 +1,4 @@
-//! Per-user settings and the list of sites, kept in `~/.config/alibi-vms/config.json`.
+//! Per-user settings and the list of sites, kept in `~/.config/alibivms/config.json`.
 //! The file holds NVR passwords, so it is written owner-only.
 
 use std::{
@@ -129,11 +129,11 @@ impl Default for Config {
 }
 
 pub fn config_dir() -> PathBuf {
-    dirs::config_dir().unwrap_or_else(|| ".".into()).join("alibi-vms")
+    dirs::config_dir().unwrap_or_else(|| ".".into()).join("alibivms")
 }
 
 pub fn data_dir() -> PathBuf {
-    dirs::data_dir().unwrap_or_else(|| ".".into()).join("alibi-vms")
+    dirs::data_dir().unwrap_or_else(|| ".".into()).join("alibivms")
 }
 
 impl Config {
@@ -451,7 +451,7 @@ mod tests {
 
     #[test]
     fn export_round_trip() {
-        let dir = std::env::temp_dir().join(format!("alibi-vms-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("alibivms-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("backup.json");
         let c = base();

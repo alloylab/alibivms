@@ -1,5 +1,5 @@
 [package]
-name = "alibi-vms"
+name = "alibivms"
 description = "Desktop viewer, playback and clip download for Alibi NVRs"
 edition.workspace = true
 version.workspace = true

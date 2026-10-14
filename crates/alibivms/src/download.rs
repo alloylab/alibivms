@@ -122,9 +122,9 @@ impl Downloads {
         for e in std::fs::read_dir(&root)?.flatten() {
             let _ = std::fs::remove_dir_all(e.path());
         }
-        let ffprobe = sibling(&ffmpeg, "ffprobe");
+        let ffprobe = sibling(&ffmpeg, &format!("ffprobe{}", std::env::consts::EXE_SUFFIX));
         // Jobs are not kept across runs, so neither are their thumbnails.
-        let thumbs = dirs::cache_dir().unwrap_or_else(|| root.join("cache")).join("alibi-vms").join("clips");
+        let thumbs = dirs::cache_dir().unwrap_or_else(|| root.join("cache")).join("alibivms").join("clips");
         let _ = std::fs::remove_dir_all(&thumbs);
         Ok(Self { jobs: Arc::default(), root, ffmpeg, ffprobe, thumbs })
     }
@@ -362,7 +362,7 @@ impl Downloads {
     /// Copies the replay stream into a Matroska file, which takes any codec the NVR sends.
     /// `progress` gets the fraction done and the pull rate (× real time) once per ffmpeg report.
     async fn capture(&self, input: &str, raw: &Path, duration: f64, scale: u32, progress: impl Fn(f32, Option<f32>)) -> anyhow::Result<()> {
-        let mut cmd = Command::new(&self.ffmpeg);
+        let mut cmd = tool(&self.ffmpeg);
         cmd.args(["-hide_banner", "-loglevel", "error", "-nostdin", "-nostats", "-y"])
             .args(["-rtsp_transport", "tcp", "-timeout", "15000000", "-i", input])
             .args(["-map", "0:v:0", "-map", "0:a:0?", "-c", "copy", "-t", &format!("{duration:.3}")])
@@ -427,7 +427,7 @@ impl Downloads {
     /// tagged `hvc1` so Apple players accept it, and the index moved to the front.
     async fn finalize(&self, raw: &Path, out: &Path) -> anyhow::Result<()> {
         let codec = self.probe_codec(raw).await.unwrap_or_default();
-        let mut cmd = Command::new(&self.ffmpeg);
+        let mut cmd = tool(&self.ffmpeg);
         cmd.args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i"])
             .arg(raw)
             .args(["-map", "0:v:0", "-map", "0:a:0?", "-c:v", "copy", "-c:a", "aac", "-b:a", "64k"]);
@@ -443,7 +443,7 @@ impl Downloads {
     }
 
     async fn probe_duration(&self, file: &Path) -> anyhow::Result<f64> {
-        let o = Command::new(&self.ffprobe)
+        let o = tool(&self.ffprobe)
             .args(["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0"])
             .arg(file)
             .output()
@@ -457,7 +457,7 @@ impl Downloads {
             tokio::fs::create_dir_all(d).await?;
         }
         let at = (duration / 2.0).min(1.0);
-        let o = Command::new(&self.ffmpeg)
+        let o = tool(&self.ffmpeg)
             .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-ss", &format!("{at:.3}"), "-i"])
             .arg(clip)
             .args(["-frames:v", "1", "-vf", "scale=160:90:force_original_aspect_ratio=increase,crop=160:90"])
@@ -472,7 +472,7 @@ impl Downloads {
     }
 
     async fn probe_codec(&self, file: &Path) -> anyhow::Result<String> {
-        let o = Command::new(&self.ffprobe)
+        let o = tool(&self.ffprobe)
             .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_name", "-of", "csv=p=0"])
             .arg(file)
             .output()
@@ -496,6 +496,25 @@ pub fn short_reason(err: &str) -> String {
         s.push('…');
     }
     s
+}
+
+/// The ffmpeg shipped next to the app in a release bundle, else whichever one is on `PATH`.
+pub fn ffmpeg_path() -> PathBuf {
+    let name = format!("ffmpeg{}", std::env::consts::EXE_SUFFIX);
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|d| d.join(&name)))
+        .filter(|p| p.is_file())
+        .unwrap_or_else(|| name.into())
+}
+
+/// A command for ffmpeg or ffprobe; on Windows it gets no console window of its own.
+#[cfg_attr(not(windows), allow(unused_mut))]
+fn tool(program: &Path) -> Command {
+    let mut cmd = Command::new(program);
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    cmd
 }
 
 fn sibling(ffmpeg: &Path, name: &str) -> PathBuf {

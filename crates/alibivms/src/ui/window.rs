@@ -50,7 +50,7 @@ pub fn build(application: &adw::Application) -> anyhow::Result<Rc<App>> {
     }
     let downloads = {
         let _rt = rt().enter();
-        Downloads::new(config::data_dir().join("tmp"), "ffmpeg".into())?
+        Downloads::new(config::data_dir().join("tmp"), crate::download::ffmpeg_path())?
     };
 
     let stack = adw::ViewStack::new();
@@ -185,7 +185,7 @@ pub fn build(application: &adw::Application) -> anyhow::Result<Rc<App>> {
         let about = adw::AboutDialog::builder()
             .application_name("Alibi VMS")
             .application_icon(APP_ID)
-            .developer_name("Alloylab")
+            .developer_name("Alloy Lab, LLC")
             .version(env!("CARGO_PKG_VERSION"))
             .comments("Live view, playback and clip download for Alibi NVRs, on site or through Star4Live.")
             .build();
