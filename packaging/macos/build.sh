@@ -35,7 +35,8 @@ sed -e 's/#.*//' -e '/^[[:space:]]*$/d' packaging/gst-plugins.txt | while read -
 done
 
 cp "$brew/share/glib-2.0/schemas/gschemas.compiled" "$res/share/glib-2.0/schemas/"
-cp -R "$brew/share/icons/Adwaita" "$brew/share/icons/hicolor" "$res/share/icons/"
+# -L: Homebrew's share/ is symlinks into the Cellar, which would dangle inside the app.
+cp -RL "$brew/share/icons/Adwaita" "$brew/share/icons/hicolor" "$res/share/icons/"
 cp -RL "$brew/etc/fonts" "$res/etc/"
 
 # Pixbuf loaders, with a cache whose paths bundle.rs fills in at start-up.
@@ -64,6 +65,10 @@ for size in 16 32 128 256 512; do
     rsvg-convert -w $((size * 2)) -h $((size * 2)) crates/alibivms/data/io.github.alloylab.alibivms.svg -o "$iconset/icon_${size}x${size}@2x.png"
 done
 iconutil -c icns "$iconset" -o "$res/alibivms.icns"
+
+# codesign rejects the bundle ("No such file or directory") if any symlink in it dangles.
+broken="$(find "$app" -type l ! -exec test -e {} \; -print)"
+[ -z "$broken" ] || { echo "error: dangling symlinks in the app:" >&2; echo "$broken" >&2; exit 1; }
 
 # Changing install names voids signatures; sign every Mach-O inside out, then the bundle.
 sign=(codesign --force --sign "$IDENTITY")
