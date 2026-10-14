@@ -100,7 +100,7 @@ cargo run --release -p alibivms
 4. Push a tag:
 
 ```sh
-git tag v0.1.1 && git push origin v0.1.1
+git tag v0.1.2 && git push origin v0.1.2
 ```
 
 [`.github/workflows/release.yml`](.github/workflows/release.yml) builds every package on native

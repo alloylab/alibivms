@@ -28,9 +28,14 @@
     <control>keyboard</control>
   </supports>
   <releases>
+    <release version="0.1.2" date="2026-10-14">
+      <description>
+        <p>Adds a button to reconnect all cameras at once (F5) and tells you when a newer version is out. AppImages are back after failing to build in 0.1.1, and the Windows installer now waits for the app to be closed before updating.</p>
+      </description>
+    </release>
     <release version="0.1.1" date="2026-10-14">
       <description>
-        <p>The app now tells you when a newer version is out, and AppImages can update themselves in place. Fixes the macOS builds, which failed at code signing.</p>
+        <p>AppImages can update themselves in place. Fixes the macOS builds, which failed at code signing.</p>
       </description>
     </release>
     <release version="0.1.0" date="2026-10-14"/>
