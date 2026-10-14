@@ -123,10 +123,20 @@ jobs:
       - uses: msys2/setup-msys2@v2
         with:
           msystem: ${{ matrix.msystem }}
-          update: true
-          pacboy: >-
-            rust:p pkgconf:p ntldd:p gtk4:p libadwaita:p gdk-pixbuf2:p librsvg:p adwaita-icon-theme:p
-            gstreamer:p gst-plugins-base:p gst-plugins-good:p gst-plugins-bad:p gst-libav:p ffmpeg:p
+          update: false
+      # Several hundred packages (mostly ffmpeg's codecs) from MSYS2's mirrors, where one stalled
+      # download fails the lot: no low-speed cut-off, and the whole install retried.
+      - name: Install packages
+        run: |
+          pkgs="rust pkgconf ntldd gtk4 libadwaita gdk-pixbuf2 librsvg adwaita-icon-theme
+                gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad gst-libav ffmpeg"
+          for attempt in 1 2 3; do
+            pacman -Syu --needed --noconfirm --disable-download-timeout \
+              $(for p in $pkgs; do echo "$MINGW_PACKAGE_PREFIX-$p"; done) && exit 0
+            echo "::warning::package install failed (attempt $attempt of 3), retrying"
+            sleep $((attempt * 30))
+          done
+          exit 1
       - run: packaging/windows/stage.sh
       - uses: actions/upload-artifact@v7
         with:
