@@ -3,6 +3,24 @@
 All notable changes to Alibi VMS. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.1.3] - 2026-10-14
+
+### Changed
+- The app no longer opens the **Add site** dialog by itself on first launch. Add a site from the
+  **Add site…** button in the empty camera list.
+- Star4Live cameras start faster: the app finishes connecting through the cloud before video
+  starts, and asks for each NVR's connection details only once.
+- Camera diagnostics show how the camera's thumbnail is doing, and why it failed if it did.
+
+### Fixed
+- On large sites, cameras near the bottom of the list never got a thumbnail. Thumbnails now load
+  in turn, starting with cameras that have none.
+- Thumbnails of Star4Live cameras often failed because connecting through the cloud ate into the
+  time allowed to grab a frame. A failed thumbnail is now retried after 30 seconds rather than 5
+  minutes, and every other retry uses the main stream, for cameras with the sub stream turned off.
+- On macOS, video flashed green as it started. Video now starts at the first full frame, which also
+  stops the grey smear sometimes seen at the start on other systems.
+
 ## [0.1.2] - 2026-10-14
 
 ### Added
@@ -43,6 +61,7 @@ First public release.
 - Packages for Linux (Flatpak, AppImage), Windows (installer) and macOS (DMG), for x86_64 and ARM64.
 - Licensed under the Elastic License 2.0.
 
+[0.1.3]: https://github.com/alloylab/alibivms/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/alloylab/alibivms/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/alloylab/alibivms/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/alloylab/alibivms/releases/tag/v0.1.0
