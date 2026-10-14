@@ -129,6 +129,7 @@ impl Player {
                 }
             }
         });
+        start_at_keyframe(&decode);
         let queue_weak = queue.downgrade();
         decode.connect_pad_added(move |_, pad| {
             let is_video = pad
@@ -287,6 +288,34 @@ fn audio_branch() -> anyhow::Result<gst::Bin> {
     });
     bin.add_pad(&gst::GhostPad::with_target(&decode.static_pad("sink").unwrap())?)?;
     Ok(bin)
+}
+
+/// Holds back what `decodebin`'s decoders are fed until a keyframe, at the start and after
+/// each flush. A stream joined mid-GOP otherwise decodes frames without their reference, which
+/// VideoToolbox (macOS) paints solid green and libav smears grey.
+pub fn start_at_keyframe(decodebin: &gst::Element) {
+    let Some(bin) = decodebin.downcast_ref::<gst::Bin>() else { return };
+    bin.connect_deep_element_added(|_, _, el| {
+        if !el.factory().is_some_and(|f| f.has_type(gst::ElementFactoryType::DECODER)) {
+            return;
+        }
+        let Some(pad) = el.static_pad("sink") else { return };
+        let waiting = std::sync::atomic::AtomicBool::new(true);
+        pad.add_probe(gst::PadProbeType::BUFFER | gst::PadProbeType::EVENT_FLUSH, move |_, info| {
+            use std::sync::atomic::Ordering::Relaxed;
+            match &info.data {
+                Some(gst::PadProbeData::Buffer(b)) if waiting.load(Relaxed) => {
+                    if b.flags().contains(gst::BufferFlags::DELTA_UNIT) {
+                        return gst::PadProbeReturn::Drop;
+                    }
+                    waiting.store(false, Relaxed);
+                }
+                Some(gst::PadProbeData::Event(e)) if e.type_() == gst::EventType::FlushStop => waiting.store(true, Relaxed),
+                _ => {}
+            }
+            gst::PadProbeReturn::Ok
+        });
+    });
 }
 
 /// Prefers libav's H.265 decoder (multi-threaded) over libde265, which is slower and smears
