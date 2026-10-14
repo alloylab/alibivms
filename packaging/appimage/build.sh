@@ -49,5 +49,10 @@ cat > "$appdir/apprun-hooks/alibivms.sh" <<'EOF'
 export GST_REGISTRY_1_0="${XDG_CACHE_HOME:-$HOME/.cache}/alibivms/gst-registry-$(uname -m).bin"
 EOF
 
+# Update information, so AppImageUpdate and launchers like Gear Lever or AppImageLauncher can
+# update in place from the latest GitHub release. Also writes the .zsync file they read, which
+# goes up with the release.
+export LDAI_UPDATE_INFORMATION="gh-releases-zsync|alloylab|alibivms|latest|alibivms-*-$ARCH.AppImage.zsync"
 OUTPUT="dist/alibivms-$VERSION-$ARCH.AppImage" "linuxdeploy-$ARCH.AppImage" --appdir "$appdir" --output appimage
+[ -f "dist/alibivms-$VERSION-$ARCH.AppImage.zsync" ] || { echo "error: no .zsync written next to the AppImage" >&2; exit 1; }
 echo "Built dist/alibivms-$VERSION-$ARCH.AppImage"
