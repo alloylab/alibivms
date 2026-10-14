@@ -55,7 +55,24 @@ Function un.onInit
   SetRegView 64
 FunctionEnd
 
+; An update can't replace the files of a running copy. Windows refuses to delete a running exe, so
+; deleting it first doubles as the check, before anything else is touched.
+!macro WaitForAppToClose UN
+  Function ${UN}WaitForAppToClose
+    retry:
+      ClearErrors
+      Delete "$INSTDIR\bin\alibivms.exe"
+      IfErrors 0 done
+      MessageBox MB_RETRYCANCEL|MB_ICONEXCLAMATION "Alibi VMS is running. Close it, then choose Retry." IDRETRY retry
+      Abort
+    done:
+  FunctionEnd
+!macroend
+!insertmacro WaitForAppToClose ""
+!insertmacro WaitForAppToClose "un."
+
 Section "Install"
+  Call WaitForAppToClose
   ; Replace, never merge with, a previous version's DLLs and plugins.
   RMDir /r "$INSTDIR\bin"
   RMDir /r "$INSTDIR\lib"
@@ -80,6 +97,7 @@ Section "Install"
 SectionEnd
 
 Section "Uninstall"
+  Call un.WaitForAppToClose
   Delete "$SMPROGRAMS\${APP_NAME}.lnk"
   RMDir /r "$INSTDIR\bin"
   RMDir /r "$INSTDIR\lib"
