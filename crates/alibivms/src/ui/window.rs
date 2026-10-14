@@ -187,6 +187,10 @@ pub fn build(application: &adw::Application) -> anyhow::Result<Rc<App>> {
             .application_icon(APP_ID)
             .developer_name("Alloy Lab, LLC")
             .version(env!("CARGO_PKG_VERSION"))
+            .copyright("© 2026 Alloy Lab, LLC")
+            .license_type(gtk::License::Custom)
+            .license("Licensed under the Elastic License 2.0 (ELv2).")
+            .website("https://github.com/alloylab/alibivms")
             .comments("Live view, playback and clip download for Alibi NVRs, on site or through Star4Live.")
             .build();
         about.add_legal_section("Disclaimer", None, gtk::License::Custom, Some(DISCLAIMER));
