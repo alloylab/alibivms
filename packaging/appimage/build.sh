@@ -53,6 +53,11 @@ EOF
 # update in place from the latest GitHub release. Also writes the .zsync file they read, which
 # goes up with the release.
 export LDAI_UPDATE_INFORMATION="gh-releases-zsync|alloylab|alibivms|latest|alibivms-*-$ARCH.AppImage.zsync"
-OUTPUT="dist/alibivms-$VERSION-$ARCH.AppImage" "linuxdeploy-$ARCH.AppImage" --appdir "$appdir" --output appimage
-[ -f "dist/alibivms-$VERSION-$ARCH.AppImage.zsync" ] || { echo "error: no .zsync written next to the AppImage" >&2; exit 1; }
-echo "Built dist/alibivms-$VERSION-$ARCH.AppImage"
+name="alibivms-$VERSION-$ARCH.AppImage"
+rm -f "$name.zsync"
+# Without our VERSION in its environment: the plugin would take it as its own (deprecated) setting.
+env -u VERSION LDAI_OUTPUT="dist/$name" "linuxdeploy-$ARCH.AppImage" --appdir "$appdir" --output appimage
+# zsyncmake writes the .zsync into the working directory, not next to the AppImage.
+[ -f "$name.zsync" ] || { echo "error: no $name.zsync was written" >&2; exit 1; }
+mv "$name.zsync" dist/
+echo "Built dist/$name and dist/$name.zsync"
