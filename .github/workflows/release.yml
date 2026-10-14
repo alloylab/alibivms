@@ -1,0 +1,224 @@
+# Builds Alibi VMS for Linux (Flatpak, AppImage), Windows (setup .exe) and macOS (.dmg), each
+# for x86_64 and aarch64 on native runners. A `v*` tag publishes a draft GitHub release with
+# every package; running it by hand (Actions → Release → Run workflow) only builds them, as
+# workflow artifacts.
+#
+# Optional secrets for a signed, notarized macOS build (ad hoc signed without them):
+#   MACOS_CERT_P12 (base64 Developer ID Application .p12), MACOS_CERT_PASSWORD,
+#   APPLE_ID, APPLE_TEAM_ID, APPLE_APP_PASSWORD (app-specific password for notarytool)
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  version:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: v
+        name: Read version, check it matches the tag
+        run: |
+          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "alibivms") | .version')"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match the crate version $version"
+            exit 1
+          fi
+
+  cargo-sources:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - run: packaging/flatpak/cargo-sources.sh
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cargo-sources
+          path: packaging/flatpak/cargo-sources.json
+
+  flatpak:
+    needs: [version, cargo-sources]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64, runner: ubuntu-24.04 }
+          - { arch: aarch64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-51
+      options: --privileged
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: cargo-sources
+          path: packaging/flatpak
+      - name: Build
+        run: |
+          flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+          flatpak-builder --arch=${{ matrix.arch }} --install-deps-from=flathub --disable-rofiles-fuse \
+            --force-clean --default-branch=stable --repo=repo build-flatpak packaging/flatpak/io.github.alloylab.alibivms.yml
+          mkdir -p dist
+          flatpak build-bundle --arch=${{ matrix.arch }} --runtime-repo=https://dl.flathub.org/repo/flathub.flatpakrepo \
+            repo dist/alibivms-${{ needs.version.outputs.version }}-${{ matrix.arch }}.flatpak io.github.alloylab.alibivms stable
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-flatpak-${{ matrix.arch }}
+          path: dist/*
+
+  appimage:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64, runner: ubuntu-24.04 }
+          - { arch: aarch64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
+    container: debian:trixie
+    steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates curl git build-essential pkg-config file patchelf \
+            desktop-file-utils libgtk-4-dev libadwaita-1-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav \
+            gstreamer1.0-pulseaudio gstreamer1.0-alsa ffmpeg adwaita-icon-theme librsvg2-common
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - run: packaging/appimage/build.sh
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-appimage-${{ matrix.arch }}
+          path: dist/*
+
+  windows:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x64, runner: windows-2025, msystem: CLANG64 }
+          - { arch: arm64, runner: windows-11-arm, msystem: CLANGARM64 }
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: ${{ matrix.msystem }}
+          update: true
+          pacboy: >-
+            rust:p pkgconf:p ntldd:p gtk4:p libadwaita:p gdk-pixbuf2:p librsvg:p adwaita-icon-theme:p
+            gstreamer:p gst-plugins-base:p gst-plugins-good:p gst-plugins-bad:p gst-libav:p ffmpeg:p
+      - run: packaging/windows/stage.sh
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-stage-${{ matrix.arch }}
+          path: target/windows/stage
+
+  windows-installer:
+    needs: [version, windows]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends nsis librsvg2-bin imagemagick
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: windows-stage-*
+          path: stages
+      - run: |
+          for arch in x64 arm64; do
+            packaging/windows/installer.sh "${{ needs.version.outputs.version }}" "$arch" "stages/windows-stage-$arch"
+          done
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-windows
+          path: dist/*
+
+  macos:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: arm64, runner: macos-15 }
+          # GitHub drops Intel macOS runners after macos-15 (autumn 2027); then cross-build or drop x64.
+          - { arch: x64, runner: macos-15-intel }
+    runs-on: ${{ matrix.runner }}
+    env:
+      SIGNED: ${{ secrets.MACOS_CERT_P12 != '' }}
+      NOTARIZE: ${{ secrets.MACOS_CERT_P12 != '' && secrets.APPLE_ID != '' }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Import signing certificate
+        if: env.SIGNED == 'true'
+        env:
+          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          pass="$(uuidgen)"
+          echo "$MACOS_CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$pass" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$pass" "$keychain"
+          security import "$RUNNER_TEMP/cert.p12" -P "$MACOS_CERT_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
+          security set-key-partition-list -S apple-tool:,apple: -k "$pass" "$keychain"
+          security list-keychains -d user -s "$keychain"
+          identity="$(security find-identity -v -p codesigning "$keychain" | sed -n 's/.*"\(Developer ID Application:.*\)"/\1/p' | head -1)"
+          echo "MACOS_SIGN_IDENTITY=$identity" >> "$GITHUB_ENV"
+      - run: packaging/macos/build.sh
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+      - name: Notarize
+        if: env.NOTARIZE == 'true'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          dmg="$(ls dist/*.dmg)"
+          xcrun notarytool submit "$dmg" --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait
+          xcrun stapler staple "$dmg"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-macos-${{ matrix.arch }}
+          path: dist/*
+
+  release:
+    if: github.ref_type == 'tag'
+    needs: [version, flatpak, appimage, windows-installer, macos]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+      - run: cd dist && sha256sum * > SHA256SUMS
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --draft --generate-notes \
+            --title "Alibi VMS ${{ needs.version.outputs.version }}"

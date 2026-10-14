@@ -1,0 +1,38 @@
+# GStreamer plugins bundled into the Windows and macOS builds, one per line, as the `<name>` in
+# lib/gstreamer-1.0/libgst<name>.{dll,dylib}. Plugin dependencies are pulled in automatically.
+# Linux builds take whole plugin packages instead (Flatpak runtime, AppImage's apt list).
+# A line `windows:<name>` or `macos:<name>` applies to that platform only.
+
+# Pipeline plumbing (rtspsrc → decodebin → convert → gtk4paintablesink / appsink)
+coreelements
+app
+playback
+typefindfunctions
+autodetect
+videoconvertscale
+audioconvert
+audioresample
+volume
+
+# RTSP from the NVRs
+rtsp
+rtp
+rtpmanager
+udp
+tcp
+
+# Parsing and decoding H.264 / H.265 video and G.711 / AAC audio
+videoparsersbad
+audioparsers
+libav
+alaw
+mulaw
+
+# Hardware decode and audio output
+windows:d3d11
+windows:d3d12
+windows:wasapi2
+windows:wasapi
+windows:directsound
+macos:applemedia
+macos:osxaudio

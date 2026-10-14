@@ -1,0 +1,62 @@
+# Built by .github/workflows/release.yml. To build locally, from the repository root:
+#   packaging/flatpak/cargo-sources.sh
+#   flatpak-builder --user --install-deps-from=flathub --force-clean --install build-flatpak packaging/flatpak/io.github.alloylab.alibivms.yml
+id: io.github.alloylab.alibivms
+runtime: org.gnome.Platform
+runtime-version: '51'
+sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: alibivms
+finish-args:
+  - --share=network
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --socket=pulseaudio
+  - --device=dri
+  # Default folder for downloaded clips.
+  - --filesystem=xdg-videos
+modules:
+  # The ffmpeg command-line tool for clip download (the runtime ships the libraries but not
+  # the tool). Static, so it never shadows the runtime's libav* used by gst-libav.
+  - name: ffmpeg
+    config-opts:
+      - --disable-doc
+      - --disable-ffplay
+      - --disable-debug
+      - --disable-autodetect
+      - --disable-x86asm
+      - --enable-zlib
+    cleanup:
+      - /include
+      - /lib
+      - /share
+    sources:
+      - type: archive
+        url: https://ffmpeg.org/releases/ffmpeg-9.0.2.tar.xz
+        sha256: 8c3850283eb25fa026482078a04051e0be17347b09ef81a0849bec15a96e002e
+
+  - name: alibivms
+    buildsystem: simple
+    build-options:
+      append-path: /usr/lib/sdk/rust-stable/bin
+      env:
+        CARGO_HOME: /run/build/alibivms/cargo
+        CARGO_NET_OFFLINE: 'true'
+    build-commands:
+      - cargo build --release --locked -p alibivms
+      - install -Dm755 target/release/alibivms /app/bin/alibivms
+      - install -Dm644 crates/alibivms/data/${FLATPAK_ID}.desktop /app/share/applications/${FLATPAK_ID}.desktop
+      - install -Dm644 crates/alibivms/data/${FLATPAK_ID}.svg /app/share/icons/hicolor/scalable/apps/${FLATPAK_ID}.svg
+      - install -Dm644 LICENSE /app/share/licenses/${FLATPAK_ID}/LICENSE
+      - install -Dm644 crates/alibivms/data/${FLATPAK_ID}.metainfo.xml /app/share/metainfo/${FLATPAK_ID}.metainfo.xml
+    sources:
+      - type: dir
+        path: ../..
+        skip:
+          - target
+          - .flatpak-builder
+          - build-flatpak
+      # Generated from Cargo.lock by cargo-sources.sh; vendors every crate for the offline build.
+      - cargo-sources.json
