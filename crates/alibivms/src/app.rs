@@ -194,7 +194,8 @@ impl App {
 }
 
 /// Camera models known to be PTZ, matched case-insensitively as prefixes. Extend from the
-/// Diagnostics dialog's reports.
+/// Diagnostics dialog's reports. Many PTZ cameras report themselves as fixed, so one missing here
+/// gets no PTZ controls until the user marks it by hand in Diagnostics.
 const PTZ_MODELS: &[&str] = &["ALI-NS7004R"];
 
 pub fn is_ptz_model(model: &str) -> bool {
