@@ -233,9 +233,6 @@ pub fn build(application: &adw::Application) -> anyhow::Result<Rc<App>> {
 
     app.window.present();
     dev_screenshot(&app);
-    if app.cfg.borrow().sites.is_empty() {
-        sites_dialog::edit(&app, None, None);
-    }
     Ok(app)
 }
 
