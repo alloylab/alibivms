@@ -95,11 +95,20 @@ where
     }
 }
 
-/// The device's WebSocket path (`/webSocketServer` on the NVRs seen so far).
+/// The device's WebSocket path (`/webSocketServer` on the NVRs seen so far). Asked once per
+/// device: it does not change, and every stream would otherwise spend a cloud LAPI call on it.
 async fn device_ws_path(account: &Account, serial: &str) -> String {
+    static PATHS: std::sync::Mutex<Option<std::collections::HashMap<String, String>>> = std::sync::Mutex::new(None);
+    if let Some(p) = PATHS.lock().unwrap().as_ref().and_then(|m| m.get(serial)) {
+        return p.clone();
+    }
     let r = account.lapi(serial, "GET", "/LAPI/V1.0/Network/WebSocketServer/URL", None).await;
     let url = r.ok().and_then(|v| v["Data"]["WSSURL"].as_str().or(v["Data"]["WSURL"].as_str()).map(str::to_string));
-    url.and_then(|u| url::Url::parse(&u).ok()).map(|u| u.path().to_string()).filter(|p| p.len() > 1).unwrap_or_else(|| "/webSocketServer".into())
+    let Some(path) = url.and_then(|u| url::Url::parse(&u).ok()).map(|u| u.path().to_string()).filter(|p| p.len() > 1) else {
+        return "/webSocketServer".into();
+    };
+    PATHS.lock().unwrap().get_or_insert_default().insert(serial.to_string(), path.clone());
+    path
 }
 
 /// `wss://<relay host>:<relay port>` + device path + relay path + relay query.

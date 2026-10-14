@@ -56,6 +56,7 @@ pub fn camera(app: &Rc<App>, cam: &Cam) {
         info.as_ref().map(|i| i.serial_number.as_str()).unwrap_or("?"),
         if ptz { "shown" } else { "hidden" },
     );
+    text.push_str(&format!("Thumbnail: {}\n", app.thumbnails.describe(cam)));
     text.push_str("\n--- Probes ---\n");
     let n = cam.channel;
     let lapi = vec![

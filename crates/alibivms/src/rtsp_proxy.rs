@@ -254,11 +254,14 @@ impl Drop for Proxy {
     }
 }
 
-/// Starts a proxy for `upstream` and returns the URL the player should open. The proxy serves
-/// exactly one connection, and only connects upstream once the player does.
+/// Connects to `upstream`, then starts a proxy for it and returns the URL the player should
+/// open. The proxy serves exactly one connection. Connecting first keeps a slow upstream (the
+/// cloud relay takes several seconds to set up) out of the player's own response timeout, and
+/// reports its failures as they are rather than as an RTSP timeout.
 pub async fn start(upstream: Upstream, scale: Option<u32>) -> anyhow::Result<Proxy> {
     let target = upstream.url().to_string();
     let url = url_parts(&target).with_context(|| format!("not an rtsp url: {target}"))?;
+    let conn = upstream.connect().await?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let local_origin = format!("rtsp://{}", listener.local_addr()?);
     let local_url = format!("{local_origin}{}", url.path);
@@ -269,7 +272,7 @@ pub async fn start(upstream: Upstream, scale: Option<u32>) -> anyhow::Result<Pro
             _ => return,
         };
         drop(listener);
-        if let Err(e) = relay(client, upstream, scale, local_origin, upstream_origin).await {
+        if let Err(e) = relay(client, conn, scale, local_origin, upstream_origin).await {
             tracing::debug!(%target, error = %format!("{e:#}"), "rtsp proxy closed");
         }
     });
@@ -293,8 +296,7 @@ fn url_parts(u: &str) -> Option<UrlParts> {
     Some(UrlParts { host, port, path: path.to_string() })
 }
 
-async fn relay(client: TcpStream, upstream: Upstream, scale: Option<u32>, local_origin: String, upstream_origin: String) -> anyhow::Result<()> {
-    let (ur, uw, creds) = upstream.connect().await?;
+async fn relay(client: TcpStream, (ur, uw, creds): (Reader, Writer, Credentials), scale: Option<u32>, local_origin: String, upstream_origin: String) -> anyhow::Result<()> {
     let _ = client.set_nodelay(true);
     let (cr, cw) = client.into_split();
     let uw = Arc::new(Mutex::new(uw));

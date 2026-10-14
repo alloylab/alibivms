@@ -1,6 +1,6 @@
-//! Small stills of each camera for the sidebar. One frame is grabbed from the sub stream through
-//! the same path live video takes (so cloud sites work too), only for cameras whose row is on
-//! screen, a couple at a time. Kept in memory and as PNGs under the cache dir, so they show
+//! Small stills of each camera for the sidebar. One frame is grabbed from the sub stream (the main
+//! one on alternate retries) through the same path live video takes (so cloud sites work too),
+//! only for cameras whose row is on screen, a couple at a time. Kept in memory and as PNGs under the cache dir, so they show
 //! straight away at the next start.
 
 use std::{
@@ -22,8 +22,11 @@ use crate::{
 };
 
 const REFRESH: Duration = Duration::from_secs(5 * 60);
+/// First wait after a failed grab, doubling with each further failure up to `MAX_BACKOFF`.
+const RETRY: Duration = Duration::from_secs(30);
 const MAX_BACKOFF: Duration = Duration::from_secs(60 * 60);
-const GRAB_TIMEOUT: Duration = Duration::from_secs(15);
+/// Long enough for a sub stream with a sparse keyframe interval to reach its next keyframe.
+const GRAB_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_GRABS: usize = 2;
 const WIDTH: i32 = 160;
 
@@ -31,6 +34,8 @@ const WIDTH: i32 = 160;
 struct Due {
     at: Option<Instant>,
     failures: u32,
+    /// Why the last grab failed, for diagnostics; cleared by a successful one.
+    error: Option<String>,
 }
 
 pub struct Thumbnails {
@@ -105,13 +110,31 @@ impl Thumbnails {
         tex
     }
 
+    /// How `cam`'s thumbnail is doing, for diagnostics.
+    pub fn describe(&self, cam: &Cam) -> String {
+        let has = self.textures.borrow().get(cam).is_some_and(Option::is_some);
+        let due = self.due.borrow();
+        let d = due.get(cam);
+        let next = d.and_then(|d| d.at).map(|at| format!(", next grab in {} s", at.saturating_duration_since(Instant::now()).as_secs())).unwrap_or_default();
+        match d.and_then(|d| d.error.as_deref().map(|e| (d.failures, e))) {
+            Some((n, e)) => format!("{} after {n} failed grab(s): {e}{next}", if has { "stale" } else { "missing" }),
+            None if has => format!("loaded{next}"),
+            None if self.enabled.get() => "not grabbed yet".into(),
+            None => "turned off".into(),
+        }
+    }
+
     /// Starts grabs for on-screen cameras that are due, within the concurrency limits.
     fn tick(self: &Rc<Self>) {
         self.pictures.borrow_mut().retain(|(_, p, _)| p.upgrade().is_some());
         if !self.enabled.get() {
             return;
         }
-        let shown: Vec<Cam> = self.pictures.borrow().iter().filter(|(_, p, _)| p.upgrade().is_some_and(|p| p.is_mapped())).map(|(c, _, _)| c.clone()).collect();
+        let mut shown: Vec<Cam> = self.pictures.borrow().iter().filter(|(_, p, _)| p.upgrade().is_some_and(|p| p.is_mapped())).map(|(c, _, _)| c.clone()).collect();
+        // Never grabbed first, then longest overdue. In list order, a site whose full round takes
+        // longer than `REFRESH` would keep refreshing its first cameras and never reach the last.
+        let at = |c: &Cam| self.due.borrow().get(c).and_then(|d| d.at);
+        shown.sort_by_cached_key(at);
         let now = Instant::now();
         for cam in shown {
             if self.busy.borrow().len() >= MAX_GRABS {
@@ -126,8 +149,10 @@ impl Thumbnails {
             }
             self.busy.borrow_mut().insert(cam.site.clone());
             let ch = cam.channel;
+            // Every other retry tries the main stream, for cameras whose sub stream is off.
+            let stream = if self.due.borrow().get(&cam).is_some_and(|d| d.failures % 2 == 1) { Stream::Main } else { Stream::Sub };
             let fetch = async move {
-                let url = site.client.live_stream_url(ch, Stream::Sub).await?;
+                let url = site.client.live_stream_url(ch, stream).await?;
                 let media = site.media(url, None, false).await?;
                 let frame = tokio::task::spawn_blocking(move || grab(&media.url, &media.creds.username, &media.creds.password)).await??;
                 anyhow::Ok(frame)
@@ -148,14 +173,17 @@ impl Thumbnails {
         let tex = match r {
             Ok(f) => {
                 d.failures = 0;
+                d.error = None;
                 d.at = Some(Instant::now() + REFRESH);
                 f.texture()
             }
             Err(e) => {
                 d.failures += 1;
-                let wait = (REFRESH * 2u32.pow(d.failures.min(4) - 1)).min(MAX_BACKOFF);
+                let wait = (RETRY * 2u32.pow(d.failures.min(8) - 1)).min(MAX_BACKOFF);
                 d.at = Some(Instant::now() + wait);
-                tracing::debug!(site = %cam.site, channel = cam.channel, error = %format!("{e:#}"), "thumbnail failed");
+                let error = format!("{e:#}");
+                tracing::debug!(site = %cam.site, channel = cam.channel, %error, "thumbnail failed");
+                d.error = Some(error);
                 return;
             }
         };
@@ -213,6 +241,7 @@ fn grab(url: &str, user: &str, password: &str) -> anyhow::Result<Frame> {
         Some(caps.and_then(|c| c.structure(0).and_then(|s| s.get::<String>("media").ok())).is_some_and(|m| m == "video").to_value())
     });
     let decode = gst::ElementFactory::make("decodebin").build()?;
+    crate::video::start_at_keyframe(&decode);
     pipeline.add_many([&src, &decode])?;
     let decode_weak = decode.downgrade();
     src.connect_pad_added(move |_, pad| {
