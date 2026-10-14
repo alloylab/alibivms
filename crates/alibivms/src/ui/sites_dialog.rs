@@ -47,6 +47,15 @@ pub fn open(app: &Rc<App>) {
     let camera_list = adw::PreferencesGroup::builder().title("Camera list").build();
     camera_list.add(&thumbs);
     page.add(&camera_list);
+    let updates = adw::SwitchRow::builder().title("Check for updates").subtitle("Asks GitHub once a day whether a newer version is out").active(app.cfg.borrow().check_updates).build();
+    let a = app.clone();
+    updates.connect_active_notify(move |s| {
+        a.cfg.borrow_mut().check_updates = s.is_active();
+        a.save_config();
+    });
+    let updates_group = adw::PreferencesGroup::builder().title("Updates").build();
+    updates_group.add(&updates);
+    page.add(&updates_group);
 
     let backup = adw::PreferencesGroup::builder().title("Backup").description("Sites, video walls and camera names, as a JSON file to keep or move to another computer.").build();
     let export = adw::ActionRow::builder().title("Export settings…").activatable(true).build();

@@ -6,7 +6,7 @@ use adw::prelude::*;
 use gtk::glib;
 
 use crate::{
-    app::{App, rt},
+    app::{App, rt, spawn_bg},
     audit::Audit,
     config::{self, Config},
     download::Downloads,
@@ -64,6 +64,10 @@ pub fn build(application: &adw::Application) -> anyhow::Result<Rc<App>> {
     header.pack_end(&gtk::MenuButton::builder().icon_name("open-menu-symbolic").menu_model(&menu).build());
     let fullscreen = gtk::Button::builder().icon_name("view-fullscreen-symbolic").tooltip_text("Full screen (F11)").action_name("win.fullscreen").build();
     header.pack_end(&fullscreen);
+    let reload = gtk::Button::builder().icon_name("view-refresh-symbolic").tooltip_text("Reconnect all cameras (F5)").action_name("win.reload").build();
+    header.pack_end(&reload);
+    let update = gtk::Button::builder().icon_name("software-update-available-symbolic").action_name("app.update").css_classes(["accent"]).visible(false).build();
+    header.pack_end(&update);
 
     let split = adw::OverlaySplitView::builder().content(&stack).min_sidebar_width(240.0).max_sidebar_width(320.0).build();
     toggle.bind_property("active", &split, "show-sidebar").bidirectional().sync_create().build();
@@ -114,9 +118,10 @@ pub fn build(application: &adw::Application) -> anyhow::Result<Rc<App>> {
     *app.alerts.borrow_mut() = Some(alerts);
 
     // Only the visible view streams video.
-    let a = app.clone();
+    let (a, r) = (app.clone(), reload.clone());
     stack.connect_visible_child_name_notify(move |s| {
         let v = s.visible_child_name().map(|n| n.to_string()).unwrap_or_default();
+        r.set_visible(v != "downloads");
         if let Some(l) = a.live.borrow().clone() {
             l.set_active(v == "live");
         }
@@ -136,6 +141,25 @@ pub fn build(application: &adw::Application) -> anyhow::Result<Rc<App>> {
         dl_page.set_badge_number(n as u32);
         glib::ControlFlow::Continue
     });
+
+    // Reconnect every camera in the open view at once, instead of each tile's Retry.
+    let act = gtk::gio::SimpleAction::new("reload", None);
+    let a = app.clone();
+    act.connect_activate(move |_, _| match a.current_view().as_str() {
+        "live" => {
+            if let Some(l) = a.live.borrow().clone() {
+                l.reload_all();
+            }
+        }
+        "playback" => {
+            if let Some(p) = a.playback.borrow().clone() {
+                p.reload_all();
+            }
+        }
+        _ => {}
+    });
+    app.window.add_action(&act);
+    application.set_accels_for_action("win.reload", &["F5"]);
 
     // Full screen hides the header and camera list; F11 or Esc brings them back.
     let fs = gtk::gio::SimpleAction::new("fullscreen", None);
@@ -179,6 +203,8 @@ pub fn build(application: &adw::Application) -> anyhow::Result<Rc<App>> {
     let act = gtk::gio::SimpleAction::new("sites", None);
     act.connect_activate(move |_, _| sites_dialog::open(&a));
     application.add_action(&act);
+    watch_for_updates(&app, application, &update);
+
     let a = app.clone();
     let act = gtk::gio::SimpleAction::new("about", None);
     act.connect_activate(move |_, _| {
@@ -239,5 +265,43 @@ fn dev_screenshot(app: &Rc<App>) {
             }
         }
         w.application().map(|a| a.quit());
+    });
+}
+
+/// Checks for a newer release shortly after start and then daily, while the setting is on. When
+/// one is out, shows `button` in the header bar and a toast once; both open the release page.
+fn watch_for_updates(app: &Rc<App>, application: &adw::Application, button: &gtk::Button) {
+    let url: Rc<RefCell<Option<String>>> = Rc::default();
+    let act = gtk::gio::SimpleAction::new("update", None);
+    let (a, u) = (app.clone(), url.clone());
+    act.connect_activate(move |_, _| {
+        if let Some(url) = u.borrow().as_deref() {
+            gtk::UriLauncher::new(url).launch(Some(&a.window), gtk::gio::Cancellable::NONE, |_| {});
+        }
+    });
+    application.add_action(&act);
+
+    let (a, b) = (Rc::downgrade(app), button.clone());
+    glib::spawn_future_local(async move {
+        glib::timeout_future(Duration::from_secs(5)).await;
+        loop {
+            let Some(app) = a.upgrade() else { return };
+            if app.cfg.borrow().check_updates && url.borrow().is_none() {
+                let (app2, b, url) = (app.clone(), b.clone(), url.clone());
+                spawn_bg(crate::update::check(), move |r| match r {
+                    Ok(Some(rel)) => {
+                        b.set_tooltip_text(Some(&format!("Alibi VMS {} is available. {}", rel.version, crate::update::how_to_update())));
+                        b.set_visible(true);
+                        *url.borrow_mut() = Some(rel.url);
+                        let t = adw::Toast::builder().title(format!("Alibi VMS {} is available", rel.version)).button_label("View").action_name("app.update").timeout(10).build();
+                        app2.toasts.add_toast(t);
+                    }
+                    Ok(None) => {}
+                    Err(e) => tracing::debug!(error = %e, "update check failed"),
+                });
+            }
+            drop(app);
+            glib::timeout_future(Duration::from_secs(24 * 60 * 60)).await;
+        }
     });
 }

@@ -731,6 +731,13 @@ impl LiveView {
         self.bar.set_visible(!full);
     }
 
+    /// Reconnects every tile that has a camera, all at once.
+    pub fn reload_all(self: &Rc<Self>) {
+        for t in self.tiles.borrow().iter() {
+            t.reload();
+        }
+    }
+
     /// Re-labels tiles after channel names arrive from the NVR.
     pub fn refresh_labels(self: &Rc<Self>) {
         for t in self.tiles.borrow().iter() {

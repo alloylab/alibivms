@@ -833,6 +833,14 @@ impl PlaybackView {
         }
     }
 
+    /// Reconnects every camera at the current position, keeping them in sync. Does nothing
+    /// before playback has started.
+    pub fn reload_all(self: &Rc<Self>) {
+        if let Some(t) = self.cursor.get().filter(|_| self.tiles.borrow().iter().any(|t| t.cam.borrow().is_some())) {
+            self.seek(t);
+        }
+    }
+
     pub fn refresh(&self) {
         self.timeline.queue_draw();
     }

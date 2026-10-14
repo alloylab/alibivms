@@ -209,14 +209,8 @@ impl Tile {
 
         let weak = Rc::downgrade(self);
         self.retry.connect_clicked(move |_| {
-            let Some(t) = weak.upgrade() else { return };
-            match t.mode {
-                Mode::Live => t.play_live(),
-                Mode::Playback => {
-                    if let Some(s) = t.last_replay.get() {
-                        t.play_replay(s);
-                    }
-                }
+            if let Some(t) = weak.upgrade() {
+                t.reload();
             }
         });
 
@@ -550,6 +544,18 @@ impl Tile {
         self.live_badge.set_visible(false);
         self.audio.set_visible(false);
         self.set_status("", false);
+    }
+
+    /// Reconnects the stream: live from now, a replay from where it last started.
+    pub fn reload(self: &Rc<Self>) {
+        match self.mode {
+            Mode::Live => self.play_live(),
+            Mode::Playback => {
+                if let Some(s) = self.last_replay.get() {
+                    self.play_replay(s);
+                }
+            }
+        }
     }
 
     pub fn play_live(self: &Rc<Self>) {
