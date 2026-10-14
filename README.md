@@ -35,10 +35,13 @@ Download the package for your system from the
 | --- | --- | --- |
 | Linux (any distro) | `alibivms-<version>-<arch>.flatpak` | `flatpak install --user alibivms-*.flatpak`. Pulls the GNOME runtime from Flathub. |
 | Linux (portable) | `alibivms-<version>-<arch>.AppImage` | `chmod +x`, then run it. Needs glibc 2.41 or newer (for example Debian 13, Ubuntu 25.04 or Fedora 42). Updates in place with AppImageUpdate, Gear Lever or AppImageLauncher. |
-| Windows 10/11 | `alibivms-<version>-windows-<x64\|arm64>-setup.exe` | The installer is unsigned, so SmartScreen warns: choose **More info → Run anyway**. |
+| Windows 10/11 | `alibivms-<version>-windows-<x64\|arm64>-setup.exe` | The installer is unsigned, so SmartScreen warns: choose **More info → Run anyway**. To update, run the new installer; your settings are kept. |
 | macOS 15+ | `alibivms-<version>-macos-<arm64\|x64>.dmg` | Drag to Applications. If macOS says it can't verify the app, right-click it and choose **Open**. |
 
 `<arch>` is `x86_64` or `aarch64`. Every release has a `SHA256SUMS` file for checking downloads.
+
+The app checks GitHub once a day for a newer release. When one is out, an update button appears in
+the header bar. You can turn this off under **Sites and settings → Updates**.
 
 ## Getting started
 
