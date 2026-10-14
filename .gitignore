@@ -1,3 +1,7 @@
+/.claude/
+/.idea/
+
 /target
 /var/
-/.claude/
+
+packaging/flatpak/cargo-sources.json
