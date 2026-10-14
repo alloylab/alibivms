@@ -123,7 +123,9 @@ jobs:
       - uses: msys2/setup-msys2@v2
         with:
           msystem: ${{ matrix.msystem }}
-          update: false
+          # The action handles the core update, which restarts MSYS2; a -Syu in a later step
+          # would kill its own shell.
+          update: true
       # Several hundred packages (mostly ffmpeg's codecs) from MSYS2's mirrors, where one stalled
       # download fails the lot: no low-speed cut-off, and the whole install retried.
       - name: Install packages
@@ -131,7 +133,7 @@ jobs:
           pkgs="rust pkgconf ntldd gtk4 libadwaita gdk-pixbuf2 librsvg adwaita-icon-theme
                 gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad gst-libav ffmpeg"
           for attempt in 1 2 3; do
-            pacman -Syu --needed --noconfirm --disable-download-timeout \
+            pacman -S --needed --noconfirm --disable-download-timeout \
               $(for p in $pkgs; do echo "$MINGW_PACKAGE_PREFIX-$p"; done) && exit 0
             echo "::warning::package install failed (attempt $attempt of 3), retrying"
             sleep $((attempt * 30))
