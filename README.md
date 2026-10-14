@@ -90,11 +90,14 @@ cargo run --release -p alibivms
 
 ## Releasing
 
-Set the version in `Cargo.toml` and add a `<release>` entry to
-`crates/alibivms/data/io.github.alloylab.alibivms.metainfo.xml`. Then push a tag:
+1. Set the version in `Cargo.toml`.
+2. Add a section for it to [`CHANGELOG.md`](CHANGELOG.md). The release notes are taken from that
+   section.
+3. Add a `<release>` entry to `crates/alibivms/data/io.github.alloylab.alibivms.metainfo.xml`.
+4. Push a tag:
 
 ```sh
-git tag v0.1.0 && git push origin v0.1.0
+git tag v0.1.1 && git push origin v0.1.1
 ```
 
 [`.github/workflows/release.yml`](.github/workflows/release.yml) builds every package on native

@@ -13,7 +13,7 @@ dependencies = [
 
 [[package]]
 name = "alibivms"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1228,7 +1228,7 @@ dependencies = [
 
 [[package]]
 name = "lapi"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "md5",
  "rand 0.9.5",

@@ -28,6 +28,11 @@
     <control>keyboard</control>
   </supports>
   <releases>
+    <release version="0.1.1" date="2026-10-14">
+      <description>
+        <p>AppImages can now update themselves in place. Fixes the macOS builds, which failed at code signing.</p>
+      </description>
+    </release>
     <release version="0.1.0" date="2026-10-14"/>
   </releases>
 </component>
