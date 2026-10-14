@@ -36,6 +36,8 @@ pub struct Player {
     audio_pad: std::sync::Arc<std::sync::Mutex<Option<gst::Pad>>>,
     /// The audio branch once attached; muting toggles its `volume`.
     audio: Rc<RefCell<Option<(gst::Bin, gst::Element)>>>,
+    /// Decoded video frames so far, to tell a frozen stream from a playing one.
+    frames: std::sync::Arc<std::sync::atomic::AtomicU64>,
     _bus: gst::bus::BusWatchGuard,
 }
 
@@ -85,6 +87,12 @@ impl Player {
         let paintable = sink.property::<gdk::Paintable>("paintable");
         pipeline.add_many([&src, &decode, &queue, &convert, &sink])?;
         gst::Element::link_many([&queue, &convert, &sink])?;
+        let frames: std::sync::Arc<std::sync::atomic::AtomicU64> = Default::default();
+        let f = frames.clone();
+        queue.static_pad("sink").unwrap().add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+            f.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            gst::PadProbeReturn::Ok
+        });
 
         // Video and audio tracks only; every pad gets linked, as an unlinked one would stall.
         src.connect("select-stream", false, |args| {
@@ -180,7 +188,7 @@ impl Player {
         })?;
 
         pipeline.set_state(gst::State::Playing).context("starting video")?;
-        Ok(Self { pipeline, paintable, queue, codec, audio_pad, audio, _bus: bus })
+        Ok(Self { pipeline, paintable, queue, codec, audio_pad, audio, frames, _bus: bus })
     }
 
     /// Plays or mutes the audio track. The first time sound is turned on the decoder and sink
@@ -215,6 +223,11 @@ impl Player {
             gst::PadProbeReturn::Remove
         });
         Ok(())
+    }
+
+    /// How many video frames have been decoded since the stream started.
+    pub fn frames(&self) -> u64 {
+        self.frames.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn video_info(&self) -> Option<VideoInfo> {

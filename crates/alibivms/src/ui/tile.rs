@@ -4,6 +4,7 @@
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
+    time::{Duration, Instant},
 };
 
 use adw::prelude::*;
@@ -25,6 +26,10 @@ pub enum Mode {
 
 /// Longest stretch one replay session asks the NVR for; seeking starts a new one.
 const REPLAY_WINDOW: i64 = 6 * 3600;
+/// A live stream that delivers no new frame for this long is restarted.
+const FROZEN_AFTER: Duration = Duration::from_secs(10);
+/// The same, before its first frame: connecting and waiting for a keyframe take a while.
+const NO_FIRST_FRAME_AFTER: Duration = Duration::from_secs(30);
 
 /// Drag payload for a camera: `site<US>channel`.
 pub const CAM_SEP: char = '\u{1f}';
@@ -612,12 +617,38 @@ impl Tile {
             match player {
                 Ok(p) => {
                     t.picture.set_paintable(Some(&p.paintable));
+                    if live {
+                        t.watch_for_freeze(req);
+                    }
                     t.replay_start.set(replay_start);
                     *t.player.borrow_mut() = Some(p);
                     *t.media.borrow_mut() = Some(media);
                 }
                 Err(e) => t.set_status(&format!("{e:#}"), true),
             }
+        });
+    }
+
+    /// Restarts the live stream of request `req` once frames stop arriving: a camera or relay
+    /// can keep the connection open without sending video, which no error ever reports.
+    fn watch_for_freeze(self: &Rc<Self>, req: u64) {
+        let weak = Rc::downgrade(self);
+        let (mut seen, mut since) = (0u64, Instant::now());
+        glib::timeout_add_local(Duration::from_secs(2), move || {
+            let Some(t) = weak.upgrade().filter(|t| t.request.get() == req) else { return glib::ControlFlow::Break };
+            let Some(frames) = t.player.borrow().as_ref().map(|p| p.frames()) else { return glib::ControlFlow::Break };
+            if frames != seen {
+                (seen, since) = (frames, Instant::now());
+                return glib::ControlFlow::Continue;
+            }
+            let limit = if frames == 0 { NO_FIRST_FRAME_AFTER } else { FROZEN_AFTER };
+            if since.elapsed() < limit {
+                return glib::ControlFlow::Continue;
+            }
+            let cam = t.cam.borrow().clone();
+            tracing::warn!(site = ?cam.as_ref().map(|c| &c.site), channel = ?cam.as_ref().map(|c| c.channel), frames, "live stream frozen, restarting");
+            t.play_live();
+            glib::ControlFlow::Break
         });
     }
 
@@ -629,7 +660,7 @@ impl Tile {
                 // Caps settle a moment after PLAYING; read the size then.
                 let weak = Rc::downgrade(self);
                 let req = self.request.get();
-                glib::timeout_add_local_once(std::time::Duration::from_millis(800), move || {
+                glib::timeout_add_local_once(Duration::from_millis(800), move || {
                     let Some(t) = weak.upgrade().filter(|t| t.request.get() == req) else { return };
                     if let Some(info) = t.player.borrow().as_ref().and_then(|p| p.video_info()) {
                         t.info.set_label(&info.label());
@@ -643,9 +674,11 @@ impl Tile {
                 self.live_badge.set_visible(false);
                 if live {
                     self.set_state(&format!("{msg} · retrying"), true, false);
-                    // Cameras and NVRs drop streams now and then: retry in a few seconds.
+                    // Cameras and NVRs drop streams now and then: retry in a few seconds. A new
+                    // request number silences this player's further events and its freeze watch.
                     let weak = Rc::downgrade(self);
-                    let req = self.request.get();
+                    let req = self.request.get() + 1;
+                    self.request.set(req);
                     glib::timeout_add_seconds_local_once(5, move || {
                         if let Some(t) = weak.upgrade().filter(|t| t.request.get() == req) {
                             t.play_live();
