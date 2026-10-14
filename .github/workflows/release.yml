@@ -210,15 +210,27 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
         with:
           pattern: dist-*
           path: dist
           merge-multiple: true
       - run: cd dist && sha256sum * > SHA256SUMS
+      - name: Release notes from CHANGELOG.md
+        run: |
+          # The section under "## [<version>]", up to the next "## [" heading or the link list.
+          awk -v v="${{ needs.version.outputs.version }}" '
+            /^## \[/ { on = index($0, "## [" v "]") == 1; next }
+            /^\[[^]]+\]: / { on = 0 }
+            on' CHANGELOG.md > notes.md
+          if ! grep -q '[^[:space:]]' notes.md; then
+            echo "::error::CHANGELOG.md has no section for ${{ needs.version.outputs.version }}"
+            exit 1
+          fi
       - name: Create draft release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --draft --generate-notes \
+          gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --draft --notes-file notes.md \
             --title "Alibi VMS ${{ needs.version.outputs.version }}"
