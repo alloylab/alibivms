@@ -44,10 +44,26 @@ pub fn setup() {
 
 /// The bundle's resource root, if the exe is running from one.
 fn root() -> Option<PathBuf> {
-    let exe = std::env::current_exe().ok()?.canonicalize().ok()?;
+    let exe = without_verbatim_prefix(std::env::current_exe().ok()?.canonicalize().ok()?);
     let dir = exe.parent()?;
     let root = if cfg!(target_os = "macos") { dir.parent()?.join("Resources") } else { dir.parent()?.to_path_buf() };
     root.join("lib/gstreamer-1.0").is_dir().then_some(root)
+}
+
+/// `canonicalize` on Windows returns `\\?\C:\...`, where `/` is not a separator. GTK joins icon
+/// theme folders with `/` and the pixbuf loader cache is written with `/`, so under that prefix
+/// neither the icon theme nor the SVG loader is found and themed icons show as missing.
+fn without_verbatim_prefix(p: PathBuf) -> PathBuf {
+    let s = p.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{rest}"));
+    }
+    match s.strip_prefix(r"\\?\") {
+        Some(rest) if rest.as_bytes().first().is_some_and(u8::is_ascii_alphabetic) && rest.as_bytes().get(1) == Some(&b':') => {
+            PathBuf::from(rest)
+        }
+        _ => p,
+    }
 }
 
 /// The bundle's `loaders.cache` names modules as `@LOADERS@/<file>`; writes a copy with this
@@ -57,6 +73,30 @@ fn pixbuf_loaders(root: &Path, cache: &Path) -> Option<PathBuf> {
     let template = std::fs::read_to_string(dir.join("loaders.cache")).ok()?;
     let loaders = dir.join("loaders").to_string_lossy().replace('\\', "/");
     let out = cache.join("pixbuf-loaders.cache");
-    std::fs::write(&out, template.replace("@LOADERS@", &loaders)).ok()?;
+    // Written whole then renamed, so a second instance starting at the same time never reads half.
+    let tmp = cache.join(format!("pixbuf-loaders.cache.{}.tmp", std::process::id()));
+    std::fs::write(&tmp, template.replace("@LOADERS@", &loaders)).ok()?;
+    if let Err(e) = std::fs::rename(&tmp, &out) {
+        let _ = std::fs::remove_file(&tmp);
+        // Windows refuses to replace a file another process holds open; whatever is there is fine.
+        if !out.is_file() {
+            eprintln!("could not write {}: {e}", out.display());
+            return None;
+        }
+    }
     Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strips_verbatim_prefix() {
+        let strip = |s: &str| without_verbatim_prefix(PathBuf::from(s)).to_string_lossy().into_owned();
+        assert_eq!(strip(r"\\?\C:\Program Files\Alibi VMS\bin\alibivms.exe"), r"C:\Program Files\Alibi VMS\bin\alibivms.exe");
+        assert_eq!(strip(r"\\?\UNC\server\share\bin\alibivms.exe"), r"\\server\share\bin\alibivms.exe");
+        assert_eq!(strip(r"\\?\Volume{abc}\bin"), r"\\?\Volume{abc}\bin");
+        assert_eq!(strip("/Applications/Alibi VMS.app/Contents/MacOS/alibivms"), "/Applications/Alibi VMS.app/Contents/MacOS/alibivms");
+    }
 }
