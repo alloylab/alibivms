@@ -5,6 +5,7 @@
 
 use std::time::Duration;
 
+use reqwest::StatusCode;
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
@@ -80,7 +81,9 @@ impl Account {
         &self.login_name
     }
 
-    async fn raw(&self, base: &str, path: &str, token: Option<&str>, body: &Value) -> Result<Envelope> {
+    /// One POST, with the HTTP status alongside the decoded envelope. A 401/403 whose body is not
+    /// an envelope is reported as one with that status as its code, so callers see the refusal.
+    async fn raw(&self, base: &str, path: &str, token: Option<&str>, body: &Value) -> Result<(StatusCode, Envelope)> {
         let url = format!("{base}{path}");
         let mut req = self.http.post(&url).json(body);
         if let Some(t) = token {
@@ -89,14 +92,36 @@ impl Account {
         let resp = req.send().await?;
         let status = resp.status();
         let text = resp.text().await?;
-        serde_json::from_str(&text).map_err(|e| Error::Decode { url, detail: format!("HTTP {status}: {e}") })
+        let env = match serde_json::from_str(&text) {
+            Ok(e) => e,
+            Err(_) if http_refused(status) => Envelope { code: status.as_u16().into(), message: format!("HTTP {status}"), data: Value::Null },
+            Err(e) => return Err(Error::Decode { url, detail: format!("HTTP {status}: {e}") }),
+        };
+        Ok((status, env))
     }
 
-    /// Finds the account's server and signs in.
+    /// Finds the account's server and signs in, replacing any current session. The sign-in dialog
+    /// uses this; everything else signs in only when there is no session (see `session`).
     pub async fn login(&self) -> Result<()> {
         let mut guard = self.session.lock().await;
+        self.sign_in(&mut guard).await
+    }
+
+    /// Signs in again after `used` was refused, unless another call already did (then the
+    /// current token is simply used next).
+    async fn relogin(&self, used: &str) -> Result<()> {
+        let mut guard = self.session.lock().await;
+        if guard.as_ref().map(|s| s.token.as_str()) != Some(used) {
+            return Ok(());
+        }
+        tracing::warn!(account = %self.login_name, "Star4Live token refused, signing in again");
+        self.sign_in(&mut guard).await
+    }
+
+    /// The sign-in exchange, with the session lock already held.
+    async fn sign_in(&self, guard: &mut Option<Session>) -> Result<()> {
         *guard = None;
-        let found = self.raw(DEFAULT_SERVER, "/openapi/user/account/server/getbyloginname", None, &json!({ "loginName": self.login_name })).await?;
+        let (_, found) = self.raw(DEFAULT_SERVER, "/openapi/user/account/server/getbyloginname", None, &json!({ "loginName": self.login_name })).await?;
         let base = match found.data["serverAddress"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
             Some(a) if a.contains("://") => a.trim_end_matches('/').to_string(),
             Some(a) => format!("https://{}", a.trim_end_matches('/')),
@@ -112,7 +137,7 @@ impl Account {
             "hardId": self.hard_id,
             "platform": "X11; Linux x86_64",
         });
-        let r = self.raw(&base, "/openapi/user/account/token/get", None, &body).await?;
+        let (_, r) = self.raw(&base, "/openapi/user/account/token/get", None, &body).await?;
         if r.code != OK {
             return Err(Error::Login(cloud_message(r.code, &r.message)));
         }
@@ -126,42 +151,38 @@ impl Account {
         Ok(())
     }
 
-    async fn session(&self) -> Result<(String, String)> {
-        if let Some(s) = self.session.lock().await.as_ref() {
-            return Ok((s.base.clone(), s.token.clone()));
+    /// The current `(server, token)`, signing in first if there is no session.
+    pub(crate) async fn session(&self) -> Result<(String, String)> {
+        let mut guard = self.session.lock().await;
+        if guard.is_none() {
+            self.sign_in(&mut guard).await?;
         }
-        self.login().await?;
-        let g = self.session.lock().await;
-        let s = g.as_ref().ok_or_else(|| Error::Login("not signed in".into()))?;
+        let s = guard.as_ref().ok_or_else(|| Error::Login("not signed in".into()))?;
         Ok((s.base.clone(), s.token.clone()))
     }
 
-    /// One API call, signing in again once if the token has lapsed.
-    async fn call(&self, path: &str, body: &Value) -> Result<Value> {
+    /// One API call, returning its `data`; signs in again once if the token has lapsed.
+    pub async fn call_raw(&self, path: &str, body: &Value) -> Result<Value> {
         let mut retried = false;
         loop {
             let (base, token) = self.session().await?;
-            let r = self.raw(&base, path, Some(&token), body).await?;
-            if r.code == OK {
+            let (status, r) = self.raw(&base, path, Some(&token), body).await?;
+            let refused = http_refused(status) || token_refused(r.code, &r.message);
+            if r.code == OK && !refused {
                 return Ok(r.data);
             }
-            if !retried && token_refused(r.code, &r.message) {
+            if refused && !retried {
                 retried = true;
-                tracing::warn!(account = %self.login_name, code = r.code, "Star4Live token refused, signing in again");
-                self.login().await?;
+                tracing::debug!(account = %self.login_name, %status, code = r.code, path, "Star4Live token refused");
+                self.relogin(&token).await?;
                 continue;
             }
             return Err(Error::Status { url: path.into(), code: r.code, text: r.message });
         }
     }
 
-    /// Any API call, returning its `data`. For diagnostics.
-    pub async fn call_raw(&self, path: &str, body: &Value) -> Result<Value> {
-        self.call(path, body).await
-    }
-
     async fn call_as<T: DeserializeOwned>(&self, path: &str, body: &Value) -> Result<T> {
-        let v = self.call(path, body).await?;
+        let v = self.call_raw(path, body).await?;
         serde_json::from_value(v).map_err(|e| Error::Decode { url: path.into(), detail: e.to_string() })
     }
 
@@ -259,10 +280,18 @@ impl Account {
             request["Data"] = b.clone();
         }
         let body = json!({ "deviceSerial": serial, "request": request });
-        let d = match self.call("/openapi/device/lapi/invoke", &body).await {
+        let d = match self.call_raw("/openapi/device/lapi/invoke", &body).await {
             Ok(d) => d,
-            // The portal falls back to the P2P tunnel with the same body.
-            Err(Error::Status { .. }) => self.call("/openapi/prm/device/p2p/invoke", &body).await?,
+            // The portal falls back to the P2P tunnel with the same body. Not worth it when the
+            // service said the request itself is bad: the fallback would fail the same way and
+            // its error would hide the real one.
+            Err(first @ Error::Status { code, .. }) if p2p_fallback_worthwhile(code) => match self.call_raw("/openapi/prm/device/p2p/invoke", &body).await {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::debug!(serial, uri, error = %e, "Star4Live P2P fallback failed too");
+                    return Err(first);
+                }
+            },
             Err(e) => return Err(e),
         };
         let resp = &d["response"];
@@ -280,13 +309,13 @@ impl Account {
 
     /// A fresh `https://<relay>/<session>?<query>` URL for one video connection.
     pub async fn relay_url(&self, serial: &str) -> Result<String> {
-        let d = self.call("/openapi/device/p2p/url/get", &json!({ "deviceSerial": serial, "connectionProtocol": 2 })).await?;
+        let d = self.call_raw("/openapi/device/p2p/url/get", &json!({ "deviceSerial": serial, "connectionProtocol": 2 })).await?;
         d["url"].as_str().map(str::to_string).ok_or_else(|| Error::Decode { url: "p2p/url/get".into(), detail: "no url".into() })
     }
 
     /// The device's current one-time password for user `admin`. It rotates every few minutes.
     pub async fn dynamic_password(&self, serial: &str) -> Result<String> {
-        let d = self.call("/openapi/device/network/nat/list", &json!({ "deviceSerialList": [serial] })).await?;
+        let d = self.call_raw("/openapi/device/network/nat/list", &json!({ "deviceSerialList": [serial] })).await?;
         d["deviceList"][0]["dynamicPasswordNew"]
             .as_str()
             .filter(|p| !p.is_empty())
@@ -295,9 +324,21 @@ impl Account {
     }
 }
 
+/// HTTP statuses that mean the access token was refused, whatever the body says.
+fn http_refused(status: StatusCode) -> bool {
+    matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
+}
+
 fn token_refused(code: i64, message: &str) -> bool {
     let m = message.to_ascii_lowercase();
     matches!(code, 401 | 403) || m.contains("token") || m.contains("login") || m.contains("expired")
+}
+
+/// Whether a failed `lapi/invoke` is worth repeating through the P2P tunnel. Codes that fault the
+/// request or the session (1003 invalid parameter, 2004 bad credentials, 401/403 refused) would
+/// fail the same way there.
+fn p2p_fallback_worthwhile(code: i64) -> bool {
+    !matches!(code, 401 | 403 | 1003 | 2004)
 }
 
 fn cloud_message(code: i64, message: &str) -> String {
@@ -317,5 +358,19 @@ mod tests {
         let m = format!("{:x}", md5::compute("secret"));
         assert_eq!(m, "5ebe2294ecd0e0f08eab7690d2a6ee69");
         assert_eq!(password_hash("secret"), format!("{:x}", md5::compute(format!("{m}5ebe2294"))));
+    }
+
+    #[test]
+    fn refusals_and_fallbacks() {
+        assert!(http_refused(StatusCode::UNAUTHORIZED));
+        assert!(http_refused(StatusCode::FORBIDDEN));
+        assert!(!http_refused(StatusCode::OK));
+        assert!(token_refused(401, ""));
+        assert!(token_refused(500, "Token expired"));
+        assert!(!token_refused(1003, "invalid parameter"));
+        assert!(p2p_fallback_worthwhile(500));
+        assert!(!p2p_fallback_worthwhile(1003));
+        assert!(!p2p_fallback_worthwhile(2004));
+        assert!(!p2p_fallback_worthwhile(403));
     }
 }

@@ -6,7 +6,10 @@
 pub mod cloud;
 pub mod digest;
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use reqwest::{Method, StatusCode, header};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -18,10 +21,28 @@ pub enum Error {
     Http(#[from] reqwest::Error),
     #[error("login failed: {0}")]
     Login(String),
+    /// The NVR rejected the username or password (or has locked the account). `unlock_in` is how
+    /// long a login is not worth retrying: the NVR's own lockout when it reports one, otherwise
+    /// this client's hold-off after the rejection.
+    #[error("{}", credentials_message(.status_code, .remaining_attempts, .unlock_in))]
+    Credentials { status_code: i64, remaining_attempts: Option<i64>, unlock_in: Option<Duration> },
     #[error("LAPI {url} returned status {code} ({text})")]
     Status { url: String, code: i64, text: String },
     #[error("unexpected response from {url}: {detail}")]
     Decode { url: String, detail: String },
+    #[error("bad argument: {0}")]
+    Argument(String),
+}
+
+fn credentials_message(status_code: &i64, remaining_attempts: &Option<i64>, unlock_in: &Option<Duration>) -> String {
+    let mut s = format!("login refused by the NVR (status {status_code})");
+    if let Some(n) = remaining_attempts {
+        s.push_str(&format!(", {n} attempts left"));
+    }
+    if let Some(d) = unlock_in {
+        s.push_str(&format!(", retry in {}s", d.as_secs()));
+    }
+    s
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -30,6 +51,38 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// back as HTTP 599 with StatusCode 60031 ("Not Authorized").
 const AUTH_FAILED: [i64; 3] = [401, 60009, 60031];
 const HTTP_NOT_AUTHORIZED: u16 = 599;
+
+/// HTTP statuses that mean the session nonce was refused, whatever the body says.
+fn http_auth_failed(status: StatusCode) -> bool {
+    status == StatusCode::UNAUTHORIZED || status.as_u16() == HTTP_NOT_AUTHORIZED
+}
+
+/// How long to stop retrying a login after the NVR rejected the credentials without saying when
+/// the account unlocks: one minute, doubling per further rejection up to sixteen minutes.
+fn rejection_hold(strikes: u32) -> Duration {
+    Duration::from_secs(60) * 2u32.pow(strikes.saturating_sub(1).min(4))
+}
+
+/// An integer that LAPI may send as a number or as a string.
+fn json_i64(v: &serde_json::Value) -> Option<i64> {
+    v.as_i64().or_else(|| v.as_str()?.trim().parse().ok())
+}
+
+/// A login rejection from the NVR, held so the client does not hammer the lockout counter.
+struct Lockout {
+    status_code: i64,
+    remaining_attempts: Option<i64>,
+    until: Instant,
+    strikes: u32,
+}
+
+impl Lockout {
+    /// The rejection as an error, if the hold has not passed.
+    fn pending(&self) -> Option<Error> {
+        let left = self.until.checked_duration_since(Instant::now())?;
+        Some(Error::Credentials { status_code: self.status_code, remaining_attempts: self.remaining_attempts, unlock_in: Some(left) })
+    }
+}
 const LOGIN_PATH: &str = "/LAPI/V1.0/System/Security/Login";
 const CGI_PATH: &str = "/cgi-bin/main-cgi";
 
@@ -184,14 +237,24 @@ impl PtzAction {
 
 const PTZ_ALL_STOP: u32 = 2305;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Credentials {
     pub username: String,
     pub password: String,
 }
 
+impl std::fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Credentials").field("username", &self.username).field("password", &"<redacted>").finish()
+    }
+}
+
+/// One login: the nonce the NVR issued and the digest HA1 for the realm it announced.
+#[derive(Clone)]
 struct Session {
     nonce: String,
+    realm: String,
+    ha1: String,
 }
 
 /// One authenticated connection to one NVR, direct or through Star4Live. Cheap to share behind
@@ -200,8 +263,11 @@ pub struct Client {
     http: reqwest::Client,
     base: url::Url,
     username: String,
-    ha1: String,
+    /// Kept because the digest realm is only known from the login challenge.
+    password: String,
     session: Mutex<Option<Session>>,
+    /// The last credentials rejection, until which logins are not retried automatically.
+    lockout: std::sync::Mutex<Option<Lockout>>,
     /// Requests hold it shared; KeepAlive, which replaces the nonce, holds it alone so no request
     /// is in flight with the nonce it retires.
     gate: tokio::sync::RwLock<()>,
@@ -210,7 +276,7 @@ pub struct Client {
 
 impl Client {
     pub fn new(base: &str, creds: &Credentials) -> Result<Self> {
-        let base = url::Url::parse(base).map_err(|e| Error::Login(format!("bad base url {base}: {e}")))?;
+        let base = url::Url::parse(base).map_err(|e| Error::Argument(format!("bad base url {base}: {e}")))?;
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(15))
             .connect_timeout(Duration::from_secs(5))
@@ -219,8 +285,9 @@ impl Client {
             http,
             base,
             username: creds.username.clone(),
-            ha1: digest::ha1(&creds.username, &creds.password),
+            password: creds.password.clone(),
             session: Mutex::new(None),
+            lockout: std::sync::Mutex::new(None),
             gate: tokio::sync::RwLock::new(()),
             cloud: None,
         })
@@ -249,16 +316,49 @@ impl Client {
         format!("{}{}", self.base.as_str().trim_end_matches('/'), path_and_query)
     }
 
-    fn auth_header(&self, nonce: &str, method: &Method, uri: &str) -> String {
-        digest::authorization(&self.username, &self.ha1, nonce, method.as_str(), uri)
+    fn auth_header(&self, s: &Session, method: &Method, uri: &str) -> String {
+        digest::authorization(&self.username, &s.ha1, &s.realm, &s.nonce, method.as_str(), uri)
     }
 
-    /// Runs the two-step login and stores the session nonce.
+    /// Makes sure the client is signed in: runs the two-step login and stores the session nonce.
+    /// Always tries, even while a credentials rejection is being held; the automatic paths wait
+    /// that out instead. For a cloud NVR this signs the Star4Live account in only if it is not
+    /// already.
     pub async fn login(&self) -> Result<()> {
         if let Some((account, _)) = &self.cloud {
-            return account.login().await;
+            return account.session().await.map(|_| ());
         }
         let mut guard = self.session.lock().await;
+        self.sign_in(&mut guard).await
+    }
+
+    /// Logs in unless a recent credentials rejection is still being held, in which case that
+    /// rejection is returned again.
+    async fn login_unless_rejected(&self) -> Result<()> {
+        if let Some(e) = self.held_rejection() {
+            return Err(e);
+        }
+        self.login().await
+    }
+
+    fn held_rejection(&self) -> Option<Error> {
+        self.lockout.lock().unwrap_or_else(|p| p.into_inner()).as_ref()?.pending()
+    }
+
+    /// Records a rejected login so it is not retried until the NVR's unlock time (or a default
+    /// hold that grows with repeated rejections) has passed.
+    fn record_rejection(&self, status_code: i64, data: &serde_json::Value) -> Error {
+        let remaining_attempts = json_i64(&data["RemainLockTimes"]);
+        let nvr_unlock = json_i64(&data["RemainUnlockTime"]).filter(|s| *s > 0).map(|s| Duration::from_secs(s as u64));
+        let mut lk = self.lockout.lock().unwrap_or_else(|p| p.into_inner());
+        let strikes = lk.as_ref().map_or(1, |l| l.strikes + 1);
+        let hold = nvr_unlock.unwrap_or_else(|| rejection_hold(strikes));
+        *lk = Some(Lockout { status_code, remaining_attempts, until: Instant::now() + hold, strikes });
+        Error::Credentials { status_code, remaining_attempts, unlock_in: Some(hold) }
+    }
+
+    /// The login exchange, with the session lock already held.
+    async fn sign_in(&self, guard: &mut Option<Session>) -> Result<()> {
         *guard = None;
         let challenge = self
             .http
@@ -272,12 +372,14 @@ impl Client {
             .and_then(|v| v.to_str().ok())
             .ok_or_else(|| Error::Login("no WWW-Authenticate on login challenge".into()))?;
         let nonce = digest::parse_nonce(www).ok_or_else(|| Error::Login(format!("no nonce in {www:?}")))?;
+        let realm = digest::parse_realm(www).unwrap_or_else(|| digest::REALM.to_string());
+        let session = Session { ha1: digest::ha1_in_realm(&self.username, &realm, &self.password), nonce, realm };
 
         let resp = self
             .http
             .put(self.url(LOGIN_PATH))
             .header(header::COOKIE, "WebLoginHandle=10081124")
-            .header(header::AUTHORIZATION, self.auth_header(&nonce, &Method::PUT, LOGIN_PATH))
+            .header(header::AUTHORIZATION, self.auth_header(&session, &Method::PUT, LOGIN_PATH))
             .send()
             .await?;
         let status = resp.status();
@@ -286,56 +388,61 @@ impl Client {
             .map_err(|e| Error::Login(format!("HTTP {status}, undecodable body: {e}")))?;
         if parsed.response.status_code != 0 {
             let data = parsed.response.data.unwrap_or_default();
-            return Err(Error::Login(format!(
-                "status {} ({}), remaining attempts {}, unlock in {}s",
-                parsed.response.status_code,
-                parsed.response.response_string,
-                data["RemainLockTimes"],
-                data["RemainUnlockTime"],
-            )));
+            let e = self.record_rejection(parsed.response.status_code, &data);
+            tracing::warn!(host = self.host(), text = %parsed.response.response_string, error = %e, "LAPI login refused");
+            return Err(e);
         }
+        *self.lockout.lock().unwrap_or_else(|p| p.into_inner()) = None;
         tracing::info!(host = self.host(), "LAPI login ok");
-        *guard = Some(Session { nonce });
+        *guard = Some(session);
         Ok(())
     }
 
-    async fn nonce(&self) -> Result<String> {
-        if let Some(s) = self.session.lock().await.as_ref() {
-            return Ok(s.nonce.clone());
+    /// The current session, logging in first if there is none (and no rejection is being held).
+    async fn session(&self) -> Result<Session> {
+        let mut guard = self.session.lock().await;
+        if let Some(s) = guard.as_ref() {
+            return Ok(s.clone());
         }
-        self.login().await?;
-        Ok(self.session.lock().await.as_ref().map(|s| s.nonce.clone()).unwrap_or_default())
+        if let Some(e) = self.held_rejection() {
+            return Err(e);
+        }
+        self.sign_in(&mut guard).await?;
+        guard.clone().ok_or_else(|| Error::Login("not signed in".into()))
     }
 
-    /// Sends one request with the session nonce; returns the nonce used alongside the answer.
-    async fn send_raw(&self, method: &Method, uri: &str, body: Option<String>, form: bool) -> Result<(StatusCode, String, String)> {
-        let _shared = self.gate.read().await;
-        let nonce = self.nonce().await?;
+    /// Sends one request signed with `s`. Callers hold `gate` shared so the nonce is not retired
+    /// by a keep-alive while the request is in flight.
+    async fn send(&self, s: &Session, method: &Method, uri: &str, body: Option<String>, form: bool) -> Result<(StatusCode, String)> {
         let mut req = self
             .http
             .request(method.clone(), self.url(uri))
             .header(header::COOKIE, "WebLoginHandle=10081124")
-            .header(header::AUTHORIZATION, self.auth_header(&nonce, method, uri));
+            .header(header::AUTHORIZATION, self.auth_header(s, method, uri));
         if let Some(b) = body {
             let ct = if form { "application/x-www-form-urlencoded; charset=UTF-8" } else { "application/json" };
             req = req.header(header::CONTENT_TYPE, ct).body(b);
         }
         let resp = req.send().await?;
-        Ok((resp.status(), resp.text().await?, nonce))
+        Ok((resp.status(), resp.text().await?))
     }
 
-    /// Logs in again after `used` was refused, unless another request already did.
+    /// Logs in again after `used` was refused, unless another request already did or a recent
+    /// credentials rejection is still being held.
     async fn relogin(&self, used: &str, uri: &str) -> Result<()> {
-        let current = self.session.lock().await.as_ref().map(|s| s.nonce.clone());
-        if current.as_deref() != Some(used) {
+        let mut guard = self.session.lock().await;
+        if guard.as_ref().map(|s| s.nonce.as_str()) != Some(used) {
             return Ok(());
+        }
+        if let Some(e) = self.held_rejection() {
+            return Err(e);
         }
         tracing::warn!(
             host = self.host(),
             uri,
             "LAPI session rejected, logging in again (if this repeats, something else is signed in to this NVR as the same user: its web page, or the NVR added twice)"
         );
-        self.login().await
+        self.sign_in(&mut guard).await
     }
 
     /// Sends one LAPI request, logging in again once if the session has lapsed.
@@ -351,12 +458,15 @@ impl Client {
         let body = body.map(|b| format!("{b}\r\n"));
         let mut retried = false;
         loop {
-            let (status, text, used) = self.send_raw(&method, uri, body.clone(), false).await?;
+            let (status, text, used) = {
+                let _shared = self.gate.read().await;
+                let s = self.session().await?;
+                let (status, text) = self.send(&s, &method, uri, body.clone(), false).await?;
+                (status, text, s.nonce)
+            };
             // Check the status before decoding Data: error responses carry an empty Data object.
             let env: std::result::Result<Envelope<serde_json::Value>, _> = serde_json::from_str(&text);
-            let auth_failed = status == StatusCode::UNAUTHORIZED
-                || status.as_u16() == HTTP_NOT_AUTHORIZED
-                || env.as_ref().is_ok_and(|e| AUTH_FAILED.contains(&e.response.status_code));
+            let auth_failed = http_auth_failed(status) || env.as_ref().is_ok_and(|e| AUTH_FAILED.contains(&e.response.status_code));
             if auth_failed && !retried {
                 retried = true;
                 self.relogin(&used, uri).await?;
@@ -383,15 +493,15 @@ impl Client {
         }
         const URI: &str = "/LAPI/V1.0/System/Security/KeepAlive";
         let _alone = self.gate.write().await;
-        let Some(nonce) = self.session.lock().await.as_ref().map(|s| s.nonce.clone()) else {
+        let Some(session) = self.session.lock().await.clone() else {
             drop(_alone);
-            return self.login().await;
+            return self.login_unless_rejected().await;
         };
         let resp = self
             .http
             .put(self.url(URI))
             .header(header::COOKIE, "WebLoginHandle=10081124")
-            .header(header::AUTHORIZATION, self.auth_header(&nonce, &Method::PUT, URI))
+            .header(header::AUTHORIZATION, self.auth_header(&session, &Method::PUT, URI))
             .send()
             .await?;
         let status = resp.status();
@@ -400,8 +510,8 @@ impl Client {
         let ok = status.is_success() && env.as_ref().is_some_and(|e| e.response.status_code == 0);
         if !ok {
             drop(_alone);
-            tracing::warn!(host = self.host(), %status, "LAPI keep-alive refused, logging in again (another sign-in to this NVR as the same user ends this one)");
-            return self.login().await;
+            tracing::debug!(host = self.host(), %status, "LAPI keep-alive refused");
+            return self.relogin(&session.nonce, URI).await;
         }
         let d = env.and_then(|e| e.response.data).unwrap_or_default();
         let next = match &d["NextNonce"] {
@@ -409,10 +519,10 @@ impl Client {
             serde_json::Value::Number(n) => Some(n.to_string()),
             _ => None,
         };
-        if let Some(n) = next.filter(|n| !n.is_empty()) {
-            if let Some(s) = self.session.lock().await.as_mut().filter(|s| s.nonce == nonce) {
-                s.nonce = n;
-            }
+        if let Some(n) = next.filter(|n| !n.is_empty())
+            && let Some(s) = self.session.lock().await.as_mut().filter(|s| s.nonce == session.nonce)
+        {
+            s.nonce = n;
         }
         Ok(())
     }
@@ -428,7 +538,7 @@ impl Client {
 
     /// Any LAPI request, returning its `Data` as JSON. For diagnostics.
     pub async fn raw(&self, method: &str, uri: &str) -> Result<serde_json::Value> {
-        let m = Method::from_bytes(method.as_bytes()).map_err(|e| Error::Login(e.to_string()))?;
+        let m = Method::from_bytes(method.as_bytes()).map_err(|e| Error::Argument(format!("method {method:?}: {e}")))?;
         self.call(m, uri, None).await
     }
 
@@ -482,12 +592,16 @@ impl Client {
 
         let mut retried = false;
         loop {
-            let nonce = self.nonce().await?;
-            let user: String = url::form_urlencoded::byte_serialize(self.username.as_bytes()).collect();
-            let json = serde_json::json!({ "cmd": 26, "szUserName": user, "u32UserLoginHandle": nonce.parse::<u64>().unwrap_or(0) });
-            let form: String = url::form_urlencoded::Serializer::new(String::new()).append_pair("json", &json.to_string()).finish();
-            let (status, text, used) = self.send_raw(&Method::POST, CGI_PATH, Some(form), true).await?;
-            if status == StatusCode::UNAUTHORIZED && !retried {
+            // The form carries the nonce too, so it is built under the gate from the same session
+            // that signs the request.
+            let (status, text, used) = {
+                let _shared = self.gate.read().await;
+                let s = self.session().await?;
+                let form = cgi_form(26, &self.username, &s.nonce);
+                let (status, text) = self.send(&s, &Method::POST, CGI_PATH, Some(form), true).await?;
+                (status, text, s.nonce)
+            };
+            if http_auth_failed(status) && !retried {
                 retried = true;
                 self.relogin(&used, CGI_PATH).await?;
                 continue;
@@ -639,6 +753,13 @@ fn cloud_lapi_data(v: &serde_json::Value) -> std::result::Result<&serde_json::Va
     Ok(field(&["Data", "data"]).unwrap_or(v))
 }
 
+/// The `json=` form body of a legacy CGI command, carrying the session nonce as the login handle.
+fn cgi_form(cmd: u32, username: &str, nonce: &str) -> String {
+    let user: String = url::form_urlencoded::byte_serialize(username.as_bytes()).collect();
+    let json = serde_json::json!({ "cmd": cmd, "szUserName": user, "u32UserLoginHandle": nonce.parse::<u64>().unwrap_or(0) });
+    url::form_urlencoded::Serializer::new(String::new()).append_pair("json", &json.to_string()).finish()
+}
+
 fn truncate(s: &str, n: usize) -> &str {
     match s.char_indices().nth(n) {
         Some((i, _)) => &s[..i],
@@ -720,5 +841,75 @@ mod tests {
     fn ptz_stop_codes_are_one_below_start() {
         assert_eq!(PtzAction::Up.start_code() - 1, 1025);
         assert_eq!(PtzAction::ZoomIn.start_code() - 1, 769);
+    }
+
+    #[test]
+    fn credentials_debug_hides_password() {
+        let c = Credentials { username: "admin".into(), password: "hunter2".into() };
+        let d = format!("{c:?}");
+        assert!(d.contains("admin"), "{d}");
+        assert!(!d.contains("hunter2"), "{d}");
+    }
+
+    #[test]
+    fn lockout_fields_parse_as_numbers_or_strings() {
+        assert_eq!(json_i64(&serde_json::json!(4)), Some(4));
+        assert_eq!(json_i64(&serde_json::json!("30")), Some(30));
+        assert_eq!(json_i64(&serde_json::json!(" 30 ")), Some(30));
+        assert_eq!(json_i64(&serde_json::json!(null)), None);
+        assert_eq!(json_i64(&serde_json::json!("x")), None);
+    }
+
+    #[test]
+    fn rejection_hold_escalates_and_caps() {
+        assert_eq!(rejection_hold(1), Duration::from_secs(60));
+        assert_eq!(rejection_hold(2), Duration::from_secs(120));
+        assert_eq!(rejection_hold(5), Duration::from_secs(960));
+        assert_eq!(rejection_hold(50), Duration::from_secs(960));
+    }
+
+    fn client() -> Client {
+        Client::new("http://10.0.0.1", &Credentials { username: "admin".into(), password: "pw".into() }).unwrap()
+    }
+
+    #[test]
+    fn rejection_uses_nvr_unlock_time_then_default_hold() {
+        let c = client();
+        // Captured shape: the NVR counts attempts down and reports the lockout once it hits.
+        let e = c.record_rejection(60004, &serde_json::json!({ "RemainLockTimes": "4", "RemainUnlockTime": 0 }));
+        match &e {
+            Error::Credentials { status_code: 60004, remaining_attempts: Some(4), unlock_in: Some(d) } => assert_eq!(*d, Duration::from_secs(60)),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(e.to_string(), "login refused by the NVR (status 60004), 4 attempts left, retry in 60s");
+        let held = c.held_rejection().expect("held");
+        assert!(matches!(held, Error::Credentials { status_code: 60004, remaining_attempts: Some(4), unlock_in: Some(_) }));
+
+        let e = c.record_rejection(60004, &serde_json::json!({ "RemainLockTimes": 0, "RemainUnlockTime": 300 }));
+        assert!(matches!(e, Error::Credentials { unlock_in: Some(d), .. } if d == Duration::from_secs(300)), "{e:?}");
+
+        // No lockout fields at all: the default hold, escalated for the third strike.
+        let e = c.record_rejection(60004, &serde_json::json!({}));
+        assert!(matches!(e, Error::Credentials { remaining_attempts: None, unlock_in: Some(d), .. } if d == Duration::from_secs(240)), "{e:?}");
+    }
+
+    #[test]
+    fn held_rejection_expires() {
+        let c = client();
+        *c.lockout.lock().unwrap() = Some(Lockout { status_code: 1, remaining_attempts: None, until: Instant::now() - Duration::from_secs(1), strikes: 1 });
+        assert!(c.held_rejection().is_none());
+        *c.lockout.lock().unwrap() = None;
+        assert!(c.held_rejection().is_none());
+    }
+
+    #[test]
+    fn cgi_form_carries_nonce_as_login_handle() {
+        let f = cgi_form(26, "ad min", "1993823051");
+        let (k, v) = url::form_urlencoded::parse(f.as_bytes()).next().unwrap();
+        assert_eq!(k, "json");
+        let j: serde_json::Value = serde_json::from_str(&v).unwrap();
+        assert_eq!(j["cmd"], 26);
+        assert_eq!(j["u32UserLoginHandle"], 1993823051u64);
+        assert_eq!(j["szUserName"], "ad+min");
     }
 }
