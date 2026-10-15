@@ -19,7 +19,9 @@ pub fn rt() -> &'static tokio::runtime::Runtime {
     RUNTIME.get_or_init(|| tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().expect("tokio runtime"))
 }
 
-/// Runs `fut` on the tokio runtime and hands its result to `then` on the GTK main thread.
+/// Runs `fut` on the tokio runtime and hands its result to `then` on the GTK main thread. If the
+/// task panics (or is cancelled with the runtime) there is no result: the panic is logged as an
+/// error and `then` is never called, so callers must not rely on it for cleanup.
 pub fn spawn_bg<F, T>(fut: F, then: impl FnOnce(T) + 'static)
 where
     F: Future<Output = T> + Send + 'static,
@@ -27,8 +29,10 @@ where
 {
     let handle = rt().spawn(fut);
     glib::spawn_future_local(async move {
-        if let Ok(v) = handle.await {
-            then(v);
+        match handle.await {
+            Ok(v) => then(v),
+            Err(e) if e.is_panic() => tracing::error!(error = %e, "background task panicked; its result is lost"),
+            Err(e) => tracing::debug!(error = %e, "background task cancelled"),
         }
     });
 }
@@ -58,8 +62,10 @@ pub struct App {
 }
 
 impl App {
+    /// Shows `msg` as plain text: error messages can carry `<` or `&`, so it is not markup.
     pub fn toast(&self, msg: impl AsRef<str>) {
         let t = adw::Toast::new(msg.as_ref());
+        t.set_use_markup(false);
         t.set_timeout(5);
         self.toasts.add_toast(t);
     }

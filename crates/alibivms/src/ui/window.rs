@@ -1,6 +1,10 @@
 //! Builds the main window: header with view switcher, camera sidebar, and the three views.
 
-use std::{cell::RefCell, rc::Rc, time::Duration};
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+    time::Duration,
+};
 
 use adw::prelude::*;
 use gtk::glib;
@@ -42,7 +46,7 @@ pub fn build(application: &adw::Application) -> anyhow::Result<Rc<App>> {
     gtk::style_context_add_provider_for_display(&display, &provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
     install_icon(&display);
 
-    let cfg = Config::load();
+    let (cfg, load_warning) = Config::load();
     let sites = Sites::default();
     {
         let _rt = rt().enter();
@@ -169,15 +173,19 @@ pub fn build(application: &adw::Application) -> anyhow::Result<Rc<App>> {
     });
     app.window.add_action(&fs);
     application.set_accels_for_action("win.fullscreen", &["F11"]);
-    let (tb, sp, tg, lv) = (toolbar.clone(), split.clone(), toggle.clone(), live.clone());
+    // The toggle is bound to the sidebar, so hiding it for full screen clears the toggle too;
+    // the state the user chose is kept here to put back afterwards.
+    let (tb, sp, lv) = (toolbar.clone(), split.clone(), live.clone());
+    let sidebar_was = Cell::new(split.shows_sidebar());
     app.window.connect_fullscreened_notify(move |w| {
         let full = w.is_fullscreen();
         tb.set_reveal_top_bars(!full);
         lv.set_fullscreen(full);
         if full {
+            sidebar_was.set(sp.shows_sidebar());
             sp.set_show_sidebar(false);
         } else {
-            sp.set_show_sidebar(tg.is_active());
+            sp.set_show_sidebar(sidebar_was.get());
         }
     });
     let keys = gtk::EventControllerKey::new();
@@ -224,14 +232,35 @@ pub fn build(application: &adw::Application) -> anyhow::Result<Rc<App>> {
     });
     application.add_action(&act);
 
-    let a = app.clone();
-    app.window.connect_close_request(move |_| {
-        let sites = a.sites.clone();
-        let _ = rt().block_on(async move { tokio::time::timeout(Duration::from_secs(3), sites.logout_all()).await });
-        glib::Propagation::Proceed
+    // Closing logs out of every NVR and lets audit writes land, in the background with a time
+    // limit, then quits; the window hides at once so the app never looks hung.
+    let (a, closing) = (app.clone(), Rc::new(Cell::new(false)));
+    app.window.connect_close_request(move |w| {
+        if closing.replace(true) {
+            return glib::Propagation::Stop;
+        }
+        w.set_visible(false);
+        let Some(application) = w.application() else { return glib::Propagation::Proceed };
+        let (sites, audit) = (a.sites.clone(), a.audit.clone());
+        let shutdown = async move {
+            let r = tokio::time::timeout(Duration::from_secs(3), async { tokio::join!(sites.logout_all(), audit.flush()) }).await;
+            if r.is_err() {
+                tracing::warn!("logout did not finish in time");
+            }
+        };
+        let app2 = application.clone();
+        spawn_bg(shutdown, move |()| app2.quit());
+        // Even if the runtime is wedged, the app quits.
+        glib::timeout_add_local_once(Duration::from_secs(4), move || application.quit());
+        glib::Propagation::Stop
     });
 
     app.window.present();
+    if let Some(w) = load_warning {
+        tracing::warn!(message = %w.message(), "config load");
+        let t = adw::Toast::builder().title(w.message()).use_markup(false).timeout(0).build();
+        app.toasts.add_toast(t);
+    }
     dev_screenshot(&app);
     Ok(app)
 }
@@ -261,7 +290,9 @@ fn dev_screenshot(app: &Rc<App>) {
                 eprintln!("screenshot failed: {e}");
             }
         }
-        w.application().map(|a| a.quit());
+        if let Some(a) = w.application() {
+            a.quit();
+        }
     });
 }
 
@@ -272,7 +303,8 @@ fn watch_for_updates(app: &Rc<App>, application: &adw::Application, button: &gtk
     let act = gtk::gio::SimpleAction::new("update", None);
     let (a, u) = (app.clone(), url.clone());
     act.connect_activate(move |_, _| {
-        if let Some(url) = u.borrow().as_deref() {
+        // Only the project's own GitHub pages are opened, whatever the API answered.
+        if let Some(url) = u.borrow().as_deref().filter(|u| u.starts_with(crate::update::RELEASES)) {
             gtk::UriLauncher::new(url).launch(Some(&a.window), gtk::gio::Cancellable::NONE, |_| {});
         }
     });
@@ -290,7 +322,7 @@ fn watch_for_updates(app: &Rc<App>, application: &adw::Application, button: &gtk
                         b.set_tooltip_text(Some(&format!("Alibi VMS {} is available. {}", rel.version, crate::update::how_to_update())));
                         b.set_visible(true);
                         *url.borrow_mut() = Some(rel.url);
-                        let t = adw::Toast::builder().title(format!("Alibi VMS {} is available", rel.version)).button_label("View").action_name("app.update").timeout(10).build();
+                        let t = adw::Toast::builder().title(format!("Alibi VMS {} is available", rel.version)).use_markup(false).button_label("View").action_name("app.update").timeout(10).build();
                         app2.toasts.add_toast(t);
                     }
                     Ok(None) => {}

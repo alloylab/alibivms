@@ -22,6 +22,8 @@ use crate::{
 const KEEPALIVE_EVERY: Duration = Duration::from_secs(30);
 const REFRESH_EVERY: u32 = 2; // keepalives per refresh
 const RETRY_AFTER_ERROR: Duration = Duration::from_secs(15);
+/// Concurrent clip pulls per site.
+const DOWNLOAD_SLOTS: usize = 2;
 
 #[derive(Debug, Clone, Default)]
 pub struct SiteStatus {
@@ -33,7 +35,9 @@ pub struct SiteStatus {
 
 pub struct Site {
     pub cfg: SiteConfig,
-    pub client: lapi::Client,
+    /// Shared with the replacement `Site` when only the name or group changes, so the NVR
+    /// session carries on.
+    pub client: Arc<lapi::Client>,
     /// NVR login for direct sites; empty for cloud sites, whose video goes through the proxy.
     pub creds: Credentials,
     status: RwLock<SiteStatus>,
@@ -110,13 +114,40 @@ impl Site {
         Ok(())
     }
 
+    /// Records a failure. Only a change of state (online, or a different error) is worth a
+    /// warning and a redraw; the same failure every retry is noted at debug.
     fn mark_error(&self, e: &lapi::Error) {
-        tracing::warn!(site = %self.cfg.id, error = %e, "site unreachable");
+        let error = e.to_string();
         let mut st = self.status.write().unwrap();
+        let changed = st.online || st.error.as_deref() != Some(error.as_str());
         st.online = false;
-        st.error = Some(e.to_string());
+        st.error = Some(error);
         drop(st);
-        self.bump();
+        if changed {
+            tracing::warn!(site = %self.cfg.id, error = %e, "site unreachable");
+            self.bump();
+        } else {
+            tracing::debug!(site = %self.cfg.id, error = %e, "site still unreachable");
+        }
+    }
+
+    /// Same NVR, same login: the session can be kept across a config edit.
+    fn same_connection(a: &SiteConfig, b: &SiteConfig) -> bool {
+        a.nvr_url == b.nvr_url && a.username == b.username && a.password == b.password && a.cloud == b.cloud
+    }
+
+    /// A copy under a new config (name, group) that shares the client and current state.
+    fn renamed(&self, cfg: SiteConfig) -> Site {
+        Site {
+            cfg,
+            client: self.client.clone(),
+            creds: self.creds.clone(),
+            status: RwLock::new(self.status()),
+            channels: RwLock::new(self.channels()),
+            cameras: RwLock::new(self.cameras.read().unwrap().clone()),
+            download_slots: Semaphore::new(DOWNLOAD_SLOTS),
+            generation: self.generation.clone(),
+        }
     }
 
     async fn run(self: Arc<Self>) {
@@ -130,7 +161,7 @@ impl Site {
             loop {
                 tokio::time::sleep(KEEPALIVE_EVERY).await;
                 ticks += 1;
-                let r = if ticks % REFRESH_EVERY == 0 { self.refresh().await } else { self.client.keep_alive().await };
+                let r = if ticks.is_multiple_of(REFRESH_EVERY) { self.refresh().await } else { self.client.keep_alive().await };
                 if let Err(e) = r {
                     self.mark_error(&e);
                     break;
@@ -145,18 +176,30 @@ struct Running {
     task: tokio::task::JoinHandle<()>,
 }
 
+impl Running {
+    fn start(site: Site) -> Self {
+        let site = Arc::new(site);
+        let task = tokio::spawn(site.clone().run());
+        Running { site, task }
+    }
+}
+
+/// A signed-in Star4Live account with the config it was created from.
+type Accounts = BTreeMap<String, (CloudAccount, Arc<Account>)>;
+
 /// The live set of sites, kept in step with the config whenever the user edits it.
 #[derive(Clone, Default)]
 pub struct Sites {
     map: Arc<RwLock<BTreeMap<String, Running>>>,
     /// Star4Live sessions by login name, shared by every site on that account.
-    accounts: Arc<RwLock<BTreeMap<String, (CloudAccount, Arc<Account>)>>>,
+    accounts: Arc<RwLock<Accounts>>,
     generation: Arc<AtomicU64>,
 }
 
 impl Sites {
-    /// Starts sites that are new or changed and stops ones that were removed or changed.
-    /// Must be called from within the tokio runtime.
+    /// Starts sites that are new or whose connection changed and stops ones that were removed or
+    /// changed. A site whose name or group alone changed keeps its session. Must be called from
+    /// within the tokio runtime.
     pub fn sync(&self, configs: &[SiteConfig], accounts: &[CloudAccount]) {
         let mut changed_accounts = Vec::new();
         {
@@ -184,7 +227,7 @@ impl Sites {
         let mut stopped = Vec::new();
         map.retain(|id, r| {
             let account_changed = r.site.cfg.cloud.as_ref().is_some_and(|c| changed_accounts.contains(&c.account));
-            let keep = !account_changed && configs.iter().any(|c| &c.id == id && *c == r.site.cfg);
+            let keep = !account_changed && configs.iter().any(|c| &c.id == id && Site::same_connection(c, &r.site.cfg));
             if !keep {
                 r.task.abort();
                 stopped.push(r.site.clone());
@@ -192,7 +235,12 @@ impl Sites {
             keep
         });
         for cfg in configs {
-            if map.contains_key(&cfg.id) {
+            if let Some(r) = map.get_mut(&cfg.id) {
+                if r.site.cfg != *cfg {
+                    // Only the name or group changed: new task and config, same session.
+                    r.task.abort();
+                    *r = Running::start(r.site.renamed(cfg.clone()));
+                }
                 continue;
             }
             let creds = Credentials { username: cfg.username.clone(), password: cfg.password.clone() };
@@ -213,19 +261,18 @@ impl Sites {
                     continue;
                 }
             };
-            let site = Arc::new(Site {
-                download_slots: Semaphore::new(2),
+            let site = Site {
+                download_slots: Semaphore::new(DOWNLOAD_SLOTS),
                 cfg: cfg.clone(),
-                client,
+                client: Arc::new(client),
                 creds,
                 status: RwLock::default(),
                 channels: RwLock::default(),
                 cameras: RwLock::default(),
                 generation: self.generation.clone(),
-            });
-            let task = tokio::spawn(site.clone().run());
+            };
             tracing::info!(site = %cfg.id, at = %cfg.location(), "site started");
-            map.insert(cfg.id.clone(), Running { site, task });
+            map.insert(cfg.id.clone(), Running::start(site));
         }
         drop(map);
         self.generation.fetch_add(1, Ordering::Relaxed);

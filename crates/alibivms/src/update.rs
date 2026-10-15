@@ -7,6 +7,8 @@ use anyhow::Context;
 use serde::Deserialize;
 
 const LATEST: &str = "https://api.github.com/repos/alloylab/alibivms/releases/latest";
+/// Where a release page must live before the app offers to open it.
+pub const RELEASES: &str = "https://github.com/alloylab/alibivms/";
 
 /// A newer release than this build.
 #[derive(Debug, Clone)]
@@ -38,6 +40,9 @@ pub async fn check() -> anyhow::Result<Option<Release>> {
         .json()
         .await?;
     let version = latest.tag_name.trim_start_matches('v').to_string();
+    if !latest.html_url.starts_with(RELEASES) {
+        anyhow::bail!("release page {} is not under {RELEASES}", latest.html_url);
+    }
     Ok(is_newer(&version, env!("CARGO_PKG_VERSION")).then_some(Release { version, url: latest.html_url }))
 }
 

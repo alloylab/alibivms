@@ -15,6 +15,11 @@ mod ui;
 mod update;
 mod video;
 
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+};
+
 use adw::prelude::*;
 use tracing_subscriber::EnvFilter;
 
@@ -36,7 +41,9 @@ fn main() -> gtk::glib::ExitCode {
     app::rt();
 
     let application = adw::Application::builder().application_id(ui::window::APP_ID).build();
-    let holder: std::rc::Rc<std::cell::RefCell<Option<std::rc::Rc<app::App>>>> = Default::default();
+    let holder: Rc<RefCell<Option<Rc<app::App>>>> = Default::default();
+    let failed = Rc::new(Cell::new(false));
+    let f = failed.clone();
     application.connect_activate(move |application| {
         if let Some(a) = holder.borrow().as_ref() {
             a.window.present();
@@ -46,11 +53,13 @@ fn main() -> gtk::glib::ExitCode {
             Ok(a) => *holder.borrow_mut() = Some(a),
             Err(e) => {
                 eprintln!("startup failed: {e:#}");
+                f.set(true);
                 application.quit();
             }
         }
     });
-    application.run()
+    let code = application.run();
+    if failed.get() { gtk::glib::ExitCode::FAILURE } else { code }
 }
 
 /// GTK's Vulkan renderer warns on every resize that the swapchain is "suboptimal"
