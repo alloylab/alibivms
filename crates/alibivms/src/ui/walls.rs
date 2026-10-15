@@ -70,10 +70,12 @@ pub fn ask_name(app: &Rc<App>, heading: &str, confirm: &str, initial: &str, exce
     d.set_close_response("cancel");
 
     // Re-checked on every keystroke; an empty name disables Save but is not shown as an error
-    // until something was typed.
+    // until something was typed. The dialog and entry own this closure through their signals,
+    // so it must hold them weakly or the dialog never goes away.
     let check = {
-        let (app, d, entry, error) = (app.clone(), d.clone(), entry.clone(), error.clone());
+        let (app, d, entry, error) = (app.clone(), d.downgrade(), entry.downgrade(), error.downgrade());
         move |show: bool| -> Option<String> {
+            let (Some(d), Some(entry), Some(error)) = (d.upgrade(), entry.upgrade(), error.upgrade()) else { return None };
             let r = check_name(&entry.text(), &app.cfg.borrow().walls, except.as_deref());
             d.set_response_enabled("ok", r.is_ok());
             match &r {
@@ -97,11 +99,13 @@ pub fn ask_name(app: &Rc<App>, heading: &str, confirm: &str, initial: &str, exce
         c(true);
     });
     let done = Rc::new(done);
-    let (c, f, dd) = (check.clone(), done.clone(), d.clone());
+    let (c, f, dd) = (check.clone(), done.clone(), d.downgrade());
     entry.connect_activate(move |_| {
         if let Some(name) = c(true) {
             f(name);
-            dd.close();
+            if let Some(d) = dd.upgrade() {
+                d.close();
+            }
         }
     });
     d.connect_response(Some("ok"), move |_, _| {
@@ -157,10 +161,8 @@ mod tests {
 
     #[test]
     fn dirty_tracking() {
-        let mut c = Config::default();
         // No wall loaded: an unsaved layout, not a modified wall.
-        c.layout = 4;
-        c.live = vec![cam("hq", 1), cam("dock", 2)];
+        let mut c = Config { layout: 4, live: vec![cam("hq", 1), cam("dock", 2)], ..Default::default() };
         assert!(!is_dirty(&c));
         c.walls.push(wall("Mixed", 4, vec![cam("hq", 1), cam("dock", 2), None, None]));
         c.active_wall = Some("Mixed".into());

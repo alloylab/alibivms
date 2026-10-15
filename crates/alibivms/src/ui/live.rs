@@ -15,10 +15,15 @@ use crate::{
     app::{App, Cam},
     config::{LiveCam, Wall},
     ui::{
+        fill_grid,
         tile::{Mode, Tile},
         walls::{self, LAYOUTS},
+        weak_fn,
     },
 };
+
+/// A wall action on the toolbar, run on the view.
+type WallAction = fn(&Rc<LiveView>);
 
 /// Toolbar text for each grid size.
 const LAYOUT_LABELS: [(&str, &str); 4] = [("1", "One camera"), ("2×2", "2 × 2 grid"), ("3×3", "3 × 3 grid"), ("4×4", "4 × 4 grid")];
@@ -216,7 +221,7 @@ impl LiveView {
             v.load_wall(n as usize - 1);
         });
         win.add_action(&act);
-        let simple: [(&str, fn(&Rc<Self>)); 4] = [("wall-save", Self::save_wall), ("wall-save-as", Self::save_wall_as), ("wall-rename", Self::rename_wall), ("wall-delete", Self::delete_wall)];
+        let simple: [(&str, WallAction); 4] = [("wall-save", Self::save_wall), ("wall-save-as", Self::save_wall_as), ("wall-rename", Self::rename_wall), ("wall-delete", Self::delete_wall)];
         for (name, f) in simple {
             let act = gio::SimpleAction::new(name, None);
             let w = Rc::downgrade(self);
@@ -294,32 +299,43 @@ impl LiveView {
         self.app.window.add_controller(keys);
     }
 
-    /// Creates the tiles for the saved layout and restores saved cameras.
+    /// Shows the saved layout and cameras. Tiles already showing the right camera and stream
+    /// keep playing (a wall switch or tour step often changes only some of them).
     pub fn build(self: &Rc<Self>) {
-        for t in self.tiles.borrow_mut().drain(..) {
-            t.stop();
-            if t.root.parent().is_some() {
-                self.grid.remove(&t.root);
-            }
-        }
         self.solo.set(None);
         let (n, saved) = {
             let mut cfg = self.app.cfg.borrow_mut();
             cfg.layout = walls::snap_layout(cfg.layout);
             (cfg.layout, cfg.live.clone())
         };
+        let mut old = std::mem::take(&mut *self.tiles.borrow_mut());
+        for t in old.drain(n.min(old.len())..) {
+            t.stop();
+        }
         let mut tiles = Vec::with_capacity(n);
         for i in 0..n {
-            let tile = Tile::new(&self.app, Mode::Live, "Pick a camera");
-            if let Some(Some(c)) = saved.get(i) {
-                tile.set_main_stream(c.main);
+            let tile = old.get(i).cloned().unwrap_or_else(|| {
+                let t = Tile::new(&self.app, Mode::Live, "Pick a camera");
+                self.wire(&t, i);
+                t
+            });
+            let want = saved.get(i).cloned().flatten();
+            let cam = want.as_ref().map(|c| Cam { site: c.site.clone(), channel: c.channel });
+            let main = want.as_ref().is_some_and(|c| c.main);
+            let same = *tile.cam.borrow() == cam && (cam.is_none() || (tile.stream() == lapi::Stream::Main) == main);
+            if !same {
+                // Clear first: zoom, sound and PTZ state belong to the old camera, and the
+                // stream toggle handler stays quiet while no camera is assigned.
+                if tile.cam.borrow().is_some() {
+                    tile.set_cam(None);
+                }
+                tile.set_main_stream(main);
                 if self.active.get() {
-                    tile.set_cam(Some(Cam { site: c.site.clone(), channel: c.channel }));
+                    tile.set_cam(cam);
                 } else {
-                    *tile.cam.borrow_mut() = Some(Cam { site: c.site.clone(), channel: c.channel });
+                    *tile.cam.borrow_mut() = cam;
                 }
             }
-            self.wire(&tile, i);
             tiles.push(tile);
         }
         *self.tiles.borrow_mut() = tiles;
@@ -339,34 +355,24 @@ impl LiveView {
             }
         });
         // Sound from one tile at a time.
-        let w = Rc::downgrade(self);
         let me = Rc::downgrade(tile);
-        *tile.on_audio.borrow_mut() = Some(Box::new(move || {
-            let (Some(v), Some(me)) = (w.upgrade(), me.upgrade()) else { return };
+        *tile.on_audio.borrow_mut() = Some(weak_fn(self, move |v| {
+            let Some(me) = me.upgrade() else { return };
             let others: Vec<_> = v.tiles.borrow().iter().filter(|t| !Rc::ptr_eq(t, &me) && t.audio_on()).cloned().collect();
             for t in others {
                 t.set_audio(false);
             }
         }));
-        let w = Rc::downgrade(self);
-        *tile.on_stream_toggled.borrow_mut() = Some(Box::new(move || {
-            if let Some(v) = w.upgrade() {
-                v.save();
-            }
-        }));
+        *tile.on_stream_toggled.borrow_mut() = Some(weak_fn(self, |v| v.save()));
         let w = Rc::downgrade(self);
         *tile.on_drop.borrow_mut() = Some(Box::new(move |cam| {
             if let Some(v) = w.upgrade() {
                 v.put(i, cam);
             }
         }));
-        let w = Rc::downgrade(self);
-        *tile.on_enlarge.borrow_mut() = Some(Box::new(move || {
-            if let Some(v) = w.upgrade() {
-                v.toggle_solo(i);
-            }
-        }));
-        let click = gtk::GestureClick::new();
+        *tile.on_enlarge.borrow_mut() = Some(weak_fn(self, move |v| v.toggle_solo(i)));
+        // Left click selects, a double click enlarges; the right button has its own menu.
+        let click = gtk::GestureClick::builder().button(gtk::gdk::BUTTON_PRIMARY).build();
         let w = Rc::downgrade(self);
         let t = Rc::downgrade(tile);
         click.connect_pressed(move |_, n, _, _| {
@@ -384,21 +390,12 @@ impl LiveView {
 
     fn arrange(&self) {
         let tiles = self.tiles.borrow();
-        for t in tiles.iter() {
-            if t.root.parent().is_some() {
-                self.grid.remove(&t.root);
-            }
-        }
         for (i, t) in tiles.iter().enumerate() {
             t.set_enlarged(self.solo.get() == Some(i));
         }
-        if let Some(t) = self.solo.get().and_then(|i| tiles.get(i)) {
-            self.grid.attach(&t.root, 0, 0, 1, 1);
-            return;
-        }
-        let cols = (tiles.len() as f64).sqrt().ceil() as i32;
-        for (i, t) in tiles.iter().enumerate() {
-            self.grid.attach(&t.root, i as i32 % cols, i as i32 / cols, 1, 1);
+        match self.solo.get().and_then(|i| tiles.get(i)) {
+            Some(t) => fill_grid(&self.grid, std::slice::from_ref(t)),
+            None => fill_grid(&self.grid, &tiles),
         }
     }
 
@@ -434,9 +431,6 @@ impl LiveView {
         let keep = n.min(tiles.len());
         for t in tiles.drain(keep..) {
             t.stop();
-            if t.root.parent().is_some() {
-                self.grid.remove(&t.root);
-            }
         }
         for i in keep..n {
             let tile = Tile::new(&self.app, Mode::Live, "Pick a camera");
@@ -747,5 +741,5 @@ impl LiveView {
 }
 
 fn tour_label(secs: u32) -> String {
-    if secs % 60 == 0 { format!("Every {} min", secs / 60) } else { format!("Every {secs} s") }
+    if secs.is_multiple_of(60) { format!("Every {} min", secs / 60) } else { format!("Every {secs} s") }
 }

@@ -24,12 +24,18 @@ pub enum Mode {
     Playback,
 }
 
-/// Longest stretch one replay session asks the NVR for; seeking starts a new one.
+/// Longest stretch one replay session asks the NVR for; it continues with a new one at the end.
 const REPLAY_WINDOW: i64 = 6 * 3600;
 /// A live stream that delivers no new frame for this long is restarted.
 const FROZEN_AFTER: Duration = Duration::from_secs(10);
 /// The same, before its first frame: connecting and waiting for a keyframe take a while.
 const NO_FIRST_FRAME_AFTER: Duration = Duration::from_secs(30);
+/// Wait before the first automatic live restart; it doubles on every failure in a row.
+const RETRY_BASE_SECS: u32 = 5;
+const RETRY_MAX_SECS: u32 = 120;
+
+pub type Callback = Box<dyn Fn()>;
+pub type CamCallback = Box<dyn Fn(Cam)>;
 
 /// Drag payload for a camera: `site<US>channel`.
 pub const CAM_SEP: char = '\u{1f}';
@@ -79,19 +85,35 @@ pub struct Tile {
     media: RefCell<Option<crate::sites::Media>>,
     /// Replay: wall-clock second at media position 0.
     replay_start: Cell<Option<i64>>,
+    /// Replay: the end the current session asked for (window end or "now").
+    replay_end: Cell<Option<i64>>,
     last_replay: Cell<Option<i64>>,
+    /// Replay speed and pause state wanted by the view, applied once each stream is up.
+    wanted_rate: Cell<f64>,
+    paused: Cell<bool>,
     /// Bumped on every (re)start so late async results for an old request are dropped.
     request: Cell<u64>,
+    /// Live restarts in a row without a frame; sets the wait before the next one.
+    restarts: Cell<u32>,
+    /// When the current stream was asked for, and how long the last one took to start.
+    started_at: Cell<Option<Instant>>,
+    startup: Cell<f64>,
+    /// The stream of the current request has reached PLAYING.
+    ready: Cell<bool>,
+    /// The camera the PTZ popover was built for.
+    ptz_for: RefCell<Option<Cam>>,
     hovered: Cell<bool>,
     pub ended: Cell<bool>,
-    pub on_ended: RefCell<Option<Box<dyn Fn()>>>,
-    pub on_stream_toggled: RefCell<Option<Box<dyn Fn()>>>,
+    pub on_ended: RefCell<Option<Callback>>,
+    /// The stream reached PLAYING (playback only).
+    pub on_playing: RefCell<Option<Callback>>,
+    pub on_stream_toggled: RefCell<Option<Callback>>,
     /// A camera was dropped on this tile.
-    pub on_drop: RefCell<Option<Box<dyn Fn(Cam)>>>,
+    pub on_drop: RefCell<Option<CamCallback>>,
     /// "Enlarge" from the context menu.
-    pub on_enlarge: RefCell<Option<Box<dyn Fn()>>>,
+    pub on_enlarge: RefCell<Option<Callback>>,
     /// Sound was turned on for this tile.
-    pub on_audio: RefCell<Option<Box<dyn Fn()>>>,
+    pub on_audio: RefCell<Option<Callback>>,
 }
 
 impl Tile {
@@ -183,11 +205,20 @@ impl Tile {
             player: RefCell::default(),
             media: RefCell::default(),
             replay_start: Cell::default(),
+            replay_end: Cell::default(),
             last_replay: Cell::default(),
+            wanted_rate: Cell::new(1.0),
+            paused: Cell::default(),
             request: Cell::default(),
+            restarts: Cell::default(),
+            started_at: Cell::default(),
+            startup: Cell::default(),
+            ready: Cell::default(),
+            ptz_for: RefCell::default(),
             hovered: Cell::default(),
             ended: Cell::default(),
             on_ended: RefCell::default(),
+            on_playing: RefCell::default(),
             on_stream_toggled: RefCell::default(),
             on_drop: RefCell::default(),
             on_enlarge: RefCell::default(),
@@ -349,10 +380,10 @@ impl Tile {
         let weak = Rc::downgrade(self);
         let act = gio::SimpleAction::new("enlarge", None);
         act.connect_activate(move |_, _| {
-            if let Some(t) = weak.upgrade() {
-                if let Some(f) = t.on_enlarge.borrow().as_ref() {
-                    f();
-                }
+            if let Some(t) = weak.upgrade()
+                && let Some(f) = t.on_enlarge.borrow().as_ref()
+            {
+                f();
             }
         });
         group.add_action(&act);
@@ -488,12 +519,13 @@ impl Tile {
         if *self.cam.borrow() != cam {
             self.audio.set_active(false);
             self.reset_zoom();
+            self.restarts.set(0);
+            self.set_ptz(None);
         }
         *self.cam.borrow_mut() = cam.clone();
         self.placeholder.set_visible(cam.is_none());
         self.update_bar();
         if cam.is_none() {
-            self.ptz.set_visible(false);
             self.live_badge.set_visible(false);
             return;
         }
@@ -511,10 +543,17 @@ impl Tile {
         self.site.set_label(&self.app.site_name(&cam.site));
         self.root.set_tooltip_text(Some(&self.app.cam_label(&cam)));
         let is_ptz = self.mode == Mode::Live && ch.is_some() && self.app.ptz(&cam).0;
-        if is_ptz != self.ptz.is_visible() {
-            self.ptz.set_visible(is_ptz);
-            self.ptz.set_popover(is_ptz.then(|| self.ptz_popover(&cam)).as_ref());
+        self.set_ptz(is_ptz.then_some(cam));
+    }
+
+    /// Shows PTZ controls for `cam`, rebuilding the popover when it was made for another camera.
+    fn set_ptz(self: &Rc<Self>, cam: Option<Cam>) {
+        if *self.ptz_for.borrow() == cam {
+            return;
         }
+        self.ptz.set_visible(cam.is_some());
+        self.ptz.set_popover(cam.as_ref().map(|c| self.ptz_popover(c)).as_ref());
+        *self.ptz_for.borrow_mut() = cam;
     }
 
     pub fn set_status(&self, text: &str, error: bool) {
@@ -541,22 +580,26 @@ impl Tile {
 
     pub fn stop(&self) {
         self.request.set(self.request.get() + 1);
+        self.ready.set(false);
+        self.started_at.set(None);
         self.player.borrow_mut().take();
         self.media.borrow_mut().take();
         self.picture.set_paintable(None::<&gdk::Paintable>);
         self.replay_start.set(None);
+        self.replay_end.set(None);
         self.info.set_visible(false);
         self.live_badge.set_visible(false);
         self.audio.set_visible(false);
         self.set_status("", false);
     }
 
-    /// Reconnects the stream: live from now, a replay from where it last started.
+    /// Reconnects the stream: live from now, a replay from where it is (or last started).
     pub fn reload(self: &Rc<Self>) {
+        self.restarts.set(0);
         match self.mode {
             Mode::Live => self.play_live(),
             Mode::Playback => {
-                if let Some(s) = self.last_replay.get() {
+                if let Some(s) = self.wall_time().map(|t| t as i64).or(self.last_replay.get()) {
                     self.play_replay(s);
                 }
             }
@@ -576,16 +619,41 @@ impl Tile {
         let end = (start + REPLAY_WINDOW).min(now());
         let ch = cam.channel;
         self.last_replay.set(Some(start));
-        self.start(cam, move |site| async move { site.client.record_url(ch, start, end, stream).await }, false, Some(start));
+        self.start(cam, move |site| async move { site.client.record_url(ch, start, end, stream).await }, false, Some((start, end)));
     }
 
-    fn start<F, Fut>(self: &Rc<Self>, cam: Cam, url: F, live: bool, replay_start: Option<i64>)
+    /// Waits before the next automatic live restart, longer after each failure in a row.
+    /// A new request number silences the current player's events and freeze watch; any user
+    /// action (retry, stream change, new camera) supersedes the pending restart the same way.
+    fn restart_live_later(self: &Rc<Self>, error: Option<&str>) {
+        let n = self.restarts.get();
+        self.restarts.set(n.saturating_add(1));
+        let delay = (RETRY_BASE_SECS << n.min(8)).min(RETRY_MAX_SECS);
+        match error {
+            Some(msg) => {
+                self.set_state(msg, true, false);
+                self.status.set_label(&format!("{} · retrying in {delay} s", app::short_error(msg)));
+            }
+            None => self.set_state(&format!("Retrying in {delay} s"), true, false),
+        }
+        let weak = Rc::downgrade(self);
+        let req = self.request.get() + 1;
+        self.request.set(req);
+        glib::timeout_add_seconds_local_once(delay, move || {
+            if let Some(t) = weak.upgrade().filter(|t| t.request.get() == req) {
+                t.play_live();
+            }
+        });
+    }
+
+    fn start<F, Fut>(self: &Rc<Self>, cam: Cam, url: F, live: bool, replay: Option<(i64, i64)>)
     where
         F: FnOnce(std::sync::Arc<crate::sites::Site>) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = lapi::Result<String>> + Send + 'static,
     {
         self.stop();
         self.ended.set(false);
+        self.started_at.set(Some(Instant::now()));
         let req = self.request.get();
         let Some(site) = self.app.sites.get(&cam.site) else {
             self.set_status("Site not connected", true);
@@ -620,7 +688,8 @@ impl Tile {
                     if live {
                         t.watch_for_freeze(req);
                     }
-                    t.replay_start.set(replay_start);
+                    t.replay_start.set(replay.map(|r| r.0));
+                    t.replay_end.set(replay.map(|r| r.1));
                     *t.player.borrow_mut() = Some(p);
                     *t.media.borrow_mut() = Some(media);
                 }
@@ -638,6 +707,10 @@ impl Tile {
             let Some(t) = weak.upgrade().filter(|t| t.request.get() == req) else { return glib::ControlFlow::Break };
             let Some(frames) = t.player.borrow().as_ref().map(|p| p.frames()) else { return glib::ControlFlow::Break };
             if frames != seen {
+                if seen == 0 {
+                    // Video is flowing: the next failure starts the back-off from scratch.
+                    t.restarts.set(0);
+                }
                 (seen, since) = (frames, Instant::now());
                 return glib::ControlFlow::Continue;
             }
@@ -647,7 +720,7 @@ impl Tile {
             }
             let cam = t.cam.borrow().clone();
             tracing::warn!(site = ?cam.as_ref().map(|c| &c.site), channel = ?cam.as_ref().map(|c| c.channel), frames, "live stream frozen, restarting");
-            t.play_live();
+            t.restart_live_later(None);
             glib::ControlFlow::Break
         });
     }
@@ -657,6 +730,10 @@ impl Tile {
             Event::Playing => {
                 self.set_status("", false);
                 self.live_badge.set_visible(live);
+                self.ready.set(true);
+                if let Some(at) = self.started_at.get() {
+                    self.startup.set(at.elapsed().as_secs_f64());
+                }
                 // Caps settle a moment after PLAYING; read the size then.
                 let weak = Rc::downgrade(self);
                 let req = self.request.get();
@@ -667,23 +744,28 @@ impl Tile {
                         t.info.set_visible(true);
                     }
                 });
+                if !live {
+                    // Speed and pause only take once the stream has prerolled.
+                    if let Some(p) = self.player.borrow().as_ref() {
+                        if self.wanted_rate.get() != 1.0 {
+                            p.set_rate(self.wanted_rate.get());
+                        }
+                        if self.paused.get() {
+                            p.set_paused(true);
+                        }
+                    }
+                    if let Some(f) = self.on_playing.borrow().as_ref() {
+                        f();
+                    }
+                }
             }
             Event::Buffering(p) if p < 100 => self.set_state(&format!("Buffering {p}%"), false, true),
             Event::Buffering(_) => self.set_status("", false),
             Event::Error(msg) => {
                 self.live_badge.set_visible(false);
                 if live {
-                    self.set_state(&format!("{msg} · retrying"), true, false);
-                    // Cameras and NVRs drop streams now and then: retry in a few seconds. A new
-                    // request number silences this player's further events and its freeze watch.
-                    let weak = Rc::downgrade(self);
-                    let req = self.request.get() + 1;
-                    self.request.set(req);
-                    glib::timeout_add_seconds_local_once(5, move || {
-                        if let Some(t) = weak.upgrade().filter(|t| t.request.get() == req) {
-                            t.play_live();
-                        }
-                    });
+                    // Cameras and NVRs drop streams now and then: retry after a while.
+                    self.restart_live_later(Some(&msg));
                 } else {
                     self.set_status(&msg, true);
                 }
@@ -691,10 +773,10 @@ impl Tile {
             Event::HasAudio => {
                 self.audio.set_visible(true);
                 // Sound stays on across reconnects and stream changes.
-                if self.audio.is_active() {
-                    if let Some(Err(e)) = self.player.borrow().as_ref().map(|p| p.set_audio(true)) {
-                        tracing::warn!(error = %e, "could not restore sound");
-                    }
+                if self.audio.is_active()
+                    && let Some(Err(e)) = self.player.borrow().as_ref().map(|p| p.set_audio(true))
+                {
+                    tracing::warn!(error = %e, "could not restore sound");
                 }
             }
             Event::AudioFailed(msg) => {
@@ -703,13 +785,23 @@ impl Tile {
             }
             Event::Ended => {
                 if live {
-                    self.play_live();
-                } else {
-                    self.ended.set(true);
-                    self.set_status("End of recording", false);
-                    if let Some(f) = self.on_ended.borrow().as_ref() {
-                        f();
-                    }
+                    self.restart_live_later(None);
+                    return;
+                }
+                // A long recording is fetched in windows: carry on with the next one when this
+                // one ran to its end (an early stop means the recording itself ended).
+                if let (Some(start), Some(end)) = (self.replay_start.get(), self.replay_end.get())
+                    && end == start + REPLAY_WINDOW
+                    && end < now() - 5
+                    && self.wall_time().is_none_or(|t| t >= (end - 60) as f64)
+                {
+                    self.play_replay(end);
+                    return;
+                }
+                self.ended.set(true);
+                self.set_status("End of recording", false);
+                if let Some(f) = self.on_ended.borrow().as_ref() {
+                    f();
                 }
             }
         }
@@ -724,21 +816,31 @@ impl Tile {
         };
         let when = self.wall_time().map(|t| t as i64).unwrap_or_else(now);
         let dir = glib::user_special_dir(glib::UserDirectory::Pictures).unwrap_or_else(glib::home_dir).join("Alibi VMS");
-        let _ = std::fs::create_dir_all(&dir);
         let label = self.app.cam_label(&cam).replace(['/', '·'], "-");
         let stamp = app::local(when).and_then(|d| d.format("%Y-%m-%d %H.%M.%S").ok()).map(|s| s.to_string()).unwrap_or_default();
         let path = dir.join(format!("{} {}.png", label.trim(), stamp));
-        match tex.save_to_png(&path) {
+        // PNG encoding of a full frame takes a while: off the main thread. The texture is immutable.
+        let (p, d) = (path.clone(), dir.clone());
+        let encode = async move {
+            tokio::task::spawn_blocking(move || {
+                std::fs::create_dir_all(&d).map_err(|e| e.to_string())?;
+                tex.save_to_png(&p).map_err(|e| e.to_string())
+            })
+            .await
+            .unwrap_or_else(|e| Err(e.to_string()))
+        };
+        let app = self.app.clone();
+        spawn_bg(encode, move |r| match r {
             Ok(()) => {
                 let toast = adw::Toast::builder().title(format!("Snapshot saved to {}", dir.display())).button_label("Open").timeout(5).build();
-                let (win, p) = (self.app.window.clone(), path.clone());
+                let win = app.window.clone();
                 toast.connect_button_clicked(move |_| {
-                    gtk::FileLauncher::new(Some(&gio::File::for_path(&p))).launch(Some(&win), gio::Cancellable::NONE, |_| {});
+                    gtk::FileLauncher::new(Some(&gio::File::for_path(&path))).launch(Some(&win), gio::Cancellable::NONE, |_| {});
                 });
-                self.app.toasts.add_toast(toast);
+                app.toasts.add_toast(toast);
             }
-            Err(e) => self.app.toast(format!("Could not save snapshot: {e}")),
-        }
+            Err(e) => app.toast(format!("Could not save snapshot: {e}")),
+        });
     }
 
     /// Wall-clock UTC second currently on screen (playback only).
@@ -748,18 +850,33 @@ impl Tile {
         Some(start as f64 + pos)
     }
 
+    /// A stream is up and has not reached the end of its recording.
     pub fn is_playing(&self) -> bool {
-        self.player.borrow().is_some()
+        self.player.borrow().is_some() && !self.ended.get()
     }
 
+    /// The current stream has reached PLAYING.
+    pub fn is_ready(&self) -> bool {
+        self.ready.get()
+    }
+
+    /// Seconds the last stream took from request to PLAYING.
+    pub fn startup_secs(&self) -> f64 {
+        self.startup.get()
+    }
+
+    /// Pauses or resumes; remembered, so a stream started later comes up in the same state.
     pub fn set_paused(&self, paused: bool) {
-        if let Some(p) = self.player.borrow().as_ref() {
+        self.paused.set(paused);
+        if let Some(p) = self.player.borrow().as_ref().filter(|_| self.ready.get()) {
             p.set_paused(paused);
         }
     }
 
+    /// Sets the replay speed; applied now if the stream is up, else once it is.
     pub fn set_rate(&self, rate: f64) {
-        if let Some(p) = self.player.borrow().as_ref() {
+        self.wanted_rate.set(rate);
+        if let Some(p) = self.player.borrow().as_ref().filter(|_| self.ready.get()) {
             p.set_rate(rate);
         }
     }

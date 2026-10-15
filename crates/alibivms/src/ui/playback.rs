@@ -17,8 +17,9 @@ use crate::{
     app::{self, App, Cam, spawn_bg},
     sites::now,
     ui::{
-        download_dialog,
+        download_dialog, fill_grid,
         tile::{Mode, Tile},
+        weak_fn,
     },
 };
 
@@ -28,6 +29,8 @@ const SPEEDS: [f64; 5] = [0.5, 1.0, 2.0, 4.0, 8.0];
 const MIN_SPAN: f64 = 300.0;
 /// Motion segments closer than this on one camera count as one event.
 const MOTION_GAP: i64 = 3;
+/// Cameras further than this from the play head are restarted at it, once per seek.
+const SYNC_SLACK: f64 = 2.0;
 
 pub struct PlaybackView {
     pub root: gtk::Box,
@@ -47,13 +50,17 @@ pub struct PlaybackView {
     tiles: RefCell<Vec<Rc<Tile>>>,
     /// Cameras chosen for playback, all on one site.
     pub selection: RefCell<Vec<Cam>>,
+    /// Local midnight starting the loaded day, and the next one (23–25 h later around DST).
     day: Cell<i64>,
+    day_end: Cell<i64>,
     /// Visible part of the timeline, in UTC seconds.
     view: Cell<(f64, f64)>,
     records: RefCell<HashMap<Cam, Vec<RecordSegment>>>,
     cursor: Cell<Option<f64>>,
     pub range: Cell<Option<(i64, i64)>>,
     playing: Cell<bool>,
+    /// The cameras have been checked against each other since the last seek or speed change.
+    synced: Cell<bool>,
     drag_from: Cell<Option<(f64, f64)>>,
     /// View at the start of a middle-button pan.
     pan_from: Cell<Option<(f64, f64)>>,
@@ -152,11 +159,13 @@ impl PlaybackView {
             tiles: RefCell::default(),
             selection: RefCell::default(),
             day: Cell::new(today),
-            view: Cell::new((today as f64, (today + 86400) as f64)),
+            day_end: Cell::new(next_day(today)),
+            view: Cell::new((today as f64, next_day(today) as f64)),
             records: RefCell::default(),
             cursor: Cell::new(None),
             range: Cell::new(None),
             playing: Cell::new(false),
+            synced: Cell::new(true),
             drag_from: Cell::new(None),
             pan_from: Cell::new(None),
             pointer_x: Cell::new(0.0),
@@ -173,7 +182,10 @@ impl PlaybackView {
         view.calendar.connect_day_selected(move |c| {
             let Some(v) = w.upgrade() else { return };
             let d = c.date();
-            if let Ok(dt) = glib::DateTime::from_local(d.year(), d.month(), d.day_of_month(), 0, 0, 0.0) {
+            // `set_day` selects the day in the calendar too; that round trip changes nothing.
+            if let Ok(dt) = glib::DateTime::from_local(d.year(), d.month(), d.day_of_month(), 0, 0, 0.0)
+                && dt.to_unix() != v.day.get()
+            {
                 v.set_day(dt.to_unix());
             }
             pop.popdown();
@@ -209,12 +221,19 @@ impl PlaybackView {
         view.play.connect_clicked(move |_| if let Some(v) = w.upgrade() { v.toggle_play() });
         let w = Rc::downgrade(&view);
         view.speed.connect_selected_notify(move |d| {
-            if let Some(v) = w.upgrade() {
-                let rate = SPEEDS[d.selected() as usize];
-                for t in v.tiles.borrow().iter() {
-                    t.set_rate(rate);
-                }
+            let Some(v) = w.upgrade() else { return };
+            let rate = SPEEDS[d.selected() as usize];
+            for t in v.tiles.borrow().iter() {
+                t.set_rate(rate);
             }
+            // Each stream takes the new speed at its own moment; line them up once they have.
+            v.synced.set(false);
+            let w = Rc::downgrade(&v);
+            glib::timeout_add_seconds_local_once(3, move || {
+                if let Some(v) = w.upgrade() {
+                    v.sync_cameras();
+                }
+            });
         });
         let w = Rc::downgrade(&view);
         view.download.connect_clicked(move |_| {
@@ -242,9 +261,15 @@ impl PlaybackView {
         self.set_day(app::day_start(self.day.get() + days * 86400 + 3 * 3600));
     }
 
+    /// Length of the loaded day in seconds.
+    fn day_len(&self) -> f64 {
+        (self.day_end.get() - self.day.get()) as f64
+    }
+
     fn set_day(self: &Rc<Self>, day: i64) {
         self.day.set(day);
-        self.view.set((day as f64, (day + 86400) as f64));
+        self.day_end.set(next_day(day));
+        self.view.set((day as f64, self.day_end.get() as f64));
         self.date_label.set_label(&app::fmt_date(day));
         if let Some(d) = app::local(day) {
             self.calendar.select_day(&d);
@@ -298,45 +323,40 @@ impl PlaybackView {
 
     fn build_tiles(self: &Rc<Self>) {
         self.stop();
-        for t in self.tiles.borrow_mut().drain(..) {
-            self.grid.remove(&t.root);
-        }
+        self.tiles.borrow_mut().clear();
         let sel = self.selection.borrow().clone();
         let mut tiles = Vec::new();
         if sel.is_empty() {
-            let t = Tile::new(&self.app, Mode::Playback, "Pick up to 4 cameras from one site on the left");
-            self.grid.attach(&t.root, 0, 0, 1, 1);
-            tiles.push(t);
+            tiles.push(Tile::new(&self.app, Mode::Playback, "Pick up to 4 cameras from one site on the left"));
         }
-        let cols = if sel.len() <= 1 { 1 } else { 2 };
-        for (i, cam) in sel.iter().enumerate() {
+        let rate = SPEEDS[self.speed.selected() as usize];
+        for cam in &sel {
             let t = Tile::new(&self.app, Mode::Playback, "");
+            t.set_rate(rate);
             t.set_cam(Some(cam.clone()));
-            let (w, c) = (Rc::downgrade(self), cam.clone());
-            t.close.connect_clicked(move |_| {
-                if let Some(v) = w.upgrade() {
-                    v.toggle(c.clone());
-                }
+            let close = weak_fn(self, {
+                let c = cam.clone();
+                move |v| v.toggle(c.clone())
             });
-            let w = Rc::downgrade(self);
-            *t.on_ended.borrow_mut() = Some(Box::new(move || {
-                if let Some(v) = w.upgrade() {
-                    if v.tiles.borrow().iter().all(|t| t.ended.get() || t.cam.borrow().is_none()) {
-                        v.set_playing(false);
-                    }
+            t.close.connect_clicked(move |_| close());
+            *t.on_ended.borrow_mut() = Some(weak_fn(self, |v| {
+                if v.tiles.borrow().iter().all(|t| t.ended.get() || t.cam.borrow().is_none()) {
+                    v.set_playing(false);
                 }
             }));
-            let w = Rc::downgrade(self);
-            *t.on_stream_toggled.borrow_mut() = Some(Box::new(move || {
-                if let Some(v) = w.upgrade() {
-                    if let Some(c) = v.cursor.get().filter(|_| v.playing.get()) {
-                        v.seek(c);
-                    }
+            *t.on_playing.borrow_mut() = Some(weak_fn(self, |v| v.sync_cameras()));
+            // A stream change restarts at the play head, paused if it was paused.
+            *t.on_stream_toggled.borrow_mut() = Some(weak_fn(self, |v| {
+                let Some(c) = v.cursor.get() else { return };
+                let paused = !v.playing.get();
+                v.seek(c);
+                if paused {
+                    v.set_paused(true);
                 }
             }));
-            self.grid.attach(&t.root, i as i32 % cols, i as i32 / cols, 1, 1);
             tiles.push(t);
         }
+        fill_grid(&self.grid, &tiles);
         *self.tiles.borrow_mut() = tiles;
         let site = sel.first().map(|c| c.site.clone());
         self.download.set_sensitive(site.is_some());
@@ -354,11 +374,11 @@ impl PlaybackView {
         self.records.borrow_mut().clear();
         self.update_motion_count();
         self.timeline.queue_draw();
-        let day = self.day.get();
+        let (day, end) = (self.day.get(), self.day_end.get());
         for cam in self.selection.borrow().iter() {
             let Some(site) = self.app.sites.get(&cam.site) else { continue };
             let (w, cam2, ch) = (Rc::downgrade(self), cam.clone(), cam.channel);
-            spawn_bg(async move { site.client.records(ch, day, day + 86400).await }, move |r| {
+            spawn_bg(async move { site.client.records(ch, day, end).await }, move |r| {
                 let Some(v) = w.upgrade() else { return };
                 if v.day.get() != day {
                     return;
@@ -491,23 +511,39 @@ impl PlaybackView {
         }
         let t = self.snap_to_recording(t).min((now() - 5) as f64);
         self.cursor.set(Some(t));
+        self.synced.set(false);
         for tile in self.tiles.borrow().iter() {
+            // Speed and pause state are remembered by the tile and applied once the stream is up.
             tile.play_replay(t as i64);
-        }
-        let rate = SPEEDS[self.speed.selected() as usize];
-        if rate != 1.0 {
-            // Applied once the streams are up.
-            let w = Rc::downgrade(self);
-            glib::timeout_add_seconds_local_once(2, move || {
-                if let Some(v) = w.upgrade() {
-                    for tile in v.tiles.borrow().iter() {
-                        tile.set_rate(rate);
-                    }
-                }
-            });
+            tile.set_paused(false);
         }
         self.set_playing(true);
         self.timeline.queue_draw();
+    }
+
+    /// Once every camera is up after a seek or speed change, restarts any that drifted from the
+    /// one furthest ahead; the others can only catch up by starting again ahead of where they are.
+    /// Runs once per seek, so a slow stream never sets off a round of restarts.
+    fn sync_cameras(self: &Rc<Self>) {
+        if self.synced.get() || !self.playing.get() {
+            return;
+        }
+        let tiles = self.tiles.borrow().clone();
+        if !tiles.iter().all(|t| t.is_ready() || t.cam.borrow().is_none()) {
+            return;
+        }
+        self.synced.set(true);
+        let times: Vec<(Rc<Tile>, f64)> = tiles.iter().filter_map(|t| t.wall_time().map(|w| (t.clone(), w))).collect();
+        let Some(lead) = times.iter().map(|(_, w)| *w).reduce(f64::max) else { return };
+        let rate = SPEEDS[self.speed.selected() as usize];
+        for (t, w) in times {
+            if lead - w > SYNC_SLACK {
+                // Aim past the leader by the time this stream needs to come up.
+                let target = lead + t.startup_secs() * rate;
+                tracing::info!(behind = lead - w, "replay camera out of step, restarting");
+                t.play_replay(target.round() as i64);
+            }
+        }
     }
 
     fn nudge(self: &Rc<Self>, by: f64) {
@@ -521,11 +557,14 @@ impl PlaybackView {
             self.seek(t);
             return;
         }
-        let playing = !self.playing.get();
+        self.set_paused(self.playing.get());
+    }
+
+    fn set_paused(&self, paused: bool) {
         for t in self.tiles.borrow().iter() {
-            t.set_paused(!playing);
+            t.set_paused(paused);
         }
-        self.set_playing(playing);
+        self.set_playing(!paused);
     }
 
     fn set_playing(&self, p: bool) {
@@ -562,9 +601,9 @@ impl PlaybackView {
 
     /// Shows `span` seconds starting at `start`, kept inside the loaded day.
     fn set_view(&self, start: f64, span: f64) {
-        let day = self.day.get() as f64;
-        let span = span.clamp(MIN_SPAN, 86400.0);
-        let start = start.clamp(day, day + 86400.0 - span);
+        let (day, len) = (self.day.get() as f64, self.day_len());
+        let span = span.clamp(MIN_SPAN, len);
+        let start = start.clamp(day, day + len - span);
         self.view.set((start, start + span));
         self.update_zoom_label();
         self.timeline.queue_draw();
@@ -573,14 +612,14 @@ impl PlaybackView {
     /// Scales the visible span by `factor`, keeping instant `t` under the same pixel.
     fn zoom_at(&self, t: f64, factor: f64) {
         let (a, b) = self.view.get();
-        let span = ((b - a) * factor).clamp(MIN_SPAN, 86400.0);
+        let span = ((b - a) * factor).clamp(MIN_SPAN, self.day_len());
         self.set_view(t - (t - a) / (b - a) * span, span);
     }
 
     /// Zoom buttons: 0 shows the whole day, otherwise zooms around the play head (or centre).
     fn zoom_button(&self, factor: f64) {
         if factor == 0.0 {
-            self.set_view(self.day.get() as f64, 86400.0);
+            self.set_view(self.day.get() as f64, self.day_len());
             return;
         }
         let (a, b) = self.view.get();
@@ -598,7 +637,7 @@ impl PlaybackView {
 
     fn update_zoom_label(&self) {
         let (a, b) = self.view.get();
-        let label = if b - a >= 86400.0 - 1.0 {
+        let label = if b - a >= self.day_len() - 1.0 {
             String::new()
         } else {
             format!("{} – {}", app::fmt_time(a as i64), app::fmt_time(b as i64))
@@ -739,9 +778,9 @@ impl PlaybackView {
         let label = |t: f64| if step < 60.0 { app::fmt_time(t as i64) } else { app::fmt_hm(t as i64) };
         cr.set_font_size(11.0);
         cr.set_line_width(1.0);
-        // Ticks fall on local clock boundaries, not UTC ones.
-        let off = app::local(a as i64).map_or(0.0, |d| d.utc_offset().as_seconds() as f64);
-        let mut t = ((a + off) / step).ceil() * step - off;
+        // Ticks fall on local clock boundaries, not UTC ones, with the offset taken at each tick
+        // so they stay on the hour across a DST change.
+        let mut t = next_tick(a, step);
         while t <= b {
             let px = x(t).round() + 0.5;
             set((text.0, text.1, text.2, 0.15));
@@ -751,7 +790,7 @@ impl PlaybackView {
             set((text.0, text.1, text.2, 0.6));
             cr.move_to(px + 3.0, 11.0);
             let _ = cr.show_text(&label(t));
-            t += step;
+            t = next_tick(t + 1.0, step);
         }
 
         // One row per camera: green normal recording, orange motion.
@@ -844,4 +883,19 @@ impl PlaybackView {
     pub fn refresh(&self) {
         self.timeline.queue_draw();
     }
+}
+
+/// Local midnight after the day starting at `day` (23–25 hours later around a DST change).
+fn next_day(day: i64) -> i64 {
+    app::day_start(day + 86400 + 3 * 3600)
+}
+
+/// The first multiple of `step` seconds on the local clock at or after `t` (UTC seconds).
+fn next_tick(t: f64, step: f64) -> f64 {
+    let offset = |t: f64| app::local(t as i64).map_or(0.0, |d| d.utc_offset().as_seconds() as f64);
+    let off = offset(t);
+    let tick = ((t + off) / step).ceil() * step - off;
+    // Past a DST change the clock boundaries move; redo it with the offset in force there.
+    let off2 = offset(tick);
+    if off2 == off { tick } else { ((t + off2) / step).ceil() * step - off2 }
 }
