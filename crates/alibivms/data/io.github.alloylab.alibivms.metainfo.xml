@@ -28,6 +28,11 @@
     <control>keyboard</control>
   </supports>
   <releases>
+    <release version="0.1.4" date="2026-10-14">
+      <description>
+        <p>Live cameras whose picture freezes, or that connect but never show a picture, now reconnect by themselves. On Windows, the icons in the header bar, menus and camera list are back.</p>
+      </description>
+    </release>
     <release version="0.1.3" date="2026-10-14">
       <description>
         <p>Camera thumbnails load for every camera, including on large Star4Live sites, and cloud cameras start faster. Video no longer flashes green on macOS as it starts, and the app no longer opens the Add site dialog on first launch.</p>

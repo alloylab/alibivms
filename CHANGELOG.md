@@ -3,6 +3,17 @@
 All notable changes to Alibi VMS. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.1.4] - 2026-10-14
+
+### Fixed
+- A live camera could freeze on its last picture, or connect and never show one, with nothing
+  saying anything was wrong. Live view now reconnects a camera that sends no new picture for 10
+  seconds (30 seconds while it is still starting).
+- A live camera that reported several errors at once could reconnect several times over. It now
+  reconnects once.
+- On Windows, the icons in the header bar, menus and camera list were missing. The app now finds
+  its icon theme next to the installed program.
+
 ## [0.1.3] - 2026-10-14
 
 ### Changed
@@ -61,6 +72,7 @@ First public release.
 - Packages for Linux (Flatpak, AppImage), Windows (installer) and macOS (DMG), for x86_64 and ARM64.
 - Licensed under the Elastic License 2.0.
 
+[0.1.4]: https://github.com/alloylab/alibivms/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/alloylab/alibivms/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/alloylab/alibivms/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/alloylab/alibivms/compare/v0.1.0...v0.1.1
