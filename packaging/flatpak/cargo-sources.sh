@@ -5,6 +5,6 @@ set -eu
 GENERATOR_REV=41c20aa10819cdb2a4f3ca171758a96d1955c018
 venv="${TMPDIR:-/tmp}/flatpak-cargo-generator"
 python3 -m venv "$venv"
-"$venv/bin/pip" install --quiet aiohttp tomlkit
+"$venv/bin/pip" install --quiet aiohttp==3.14.5 tomlkit==0.15.1
 curl -fsSL "https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/$GENERATOR_REV/cargo/flatpak-cargo-generator.py" -o "$venv/generator.py"
 "$venv/bin/python" "$venv/generator.py" Cargo.lock -o packaging/flatpak/cargo-sources.json

@@ -28,7 +28,11 @@ VIAddVersionKey "LegalCopyright" "${PUBLISHER}"
 
 !define MUI_ICON "${ICON}"
 !define MUI_UNICON "${ICON}"
-!define MUI_FINISHPAGE_RUN "$INSTDIR\bin\alibivms.exe"
+; The installer runs elevated; the app must not, or its settings would land in the
+; administrator's %APPDATA%. Explorer launches it as the signed-in user.
+!define MUI_FINISHPAGE_RUN ""
+!define MUI_FINISHPAGE_RUN_TEXT "Start ${APP_NAME}"
+!define MUI_FINISHPAGE_RUN_FUNCTION StartApp
 !insertmacro MUI_PAGE_LICENSE "${LICENSE}"
 !insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_INSTFILES
@@ -53,6 +57,10 @@ FunctionEnd
 
 Function un.onInit
   SetRegView 64
+FunctionEnd
+
+Function StartApp
+  Exec '"$WINDIR\explorer.exe" "$INSTDIR\bin\alibivms.exe"'
 FunctionEnd
 
 ; An update can't replace the files of a running copy. Windows refuses to delete a running exe, so

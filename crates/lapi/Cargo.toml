@@ -4,6 +4,7 @@ description = "Client for the Uniview/Alibi NVR LAPI HTTP API"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 thiserror.workspace = true

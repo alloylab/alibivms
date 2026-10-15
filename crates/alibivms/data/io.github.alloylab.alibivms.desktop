@@ -6,6 +6,6 @@ Comment=Live view, playback and clip download for Alibi NVRs
 Exec=alibivms
 Icon=io.github.alloylab.alibivms
 Terminal=false
-Categories=AudioVideo;Video;Security;
+Categories=AudioVideo;Video;
 Keywords=NVR;CCTV;camera;surveillance;Star4Live;
 StartupWMClass=io.github.alloylab.alibivms

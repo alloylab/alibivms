@@ -20,11 +20,30 @@ appdir="$PWD/target/AppDir"
 mkdir -p "$tools" dist
 rm -rf "$appdir"
 
-fetch() { [ -f "$tools/$2" ] || curl -fsSL "$1" -o "$tools/$2"; chmod +x "$tools/$2"; }
-fetch "https://github.com/linuxdeploy/linuxdeploy/releases/download/$LINUXDEPLOY_REL/linuxdeploy-$ARCH.AppImage" "linuxdeploy-$ARCH.AppImage"
-fetch "https://github.com/linuxdeploy/linuxdeploy-plugin-appimage/releases/download/$APPIMAGE_PLUGIN_REL/linuxdeploy-plugin-appimage-$ARCH.AppImage" "linuxdeploy-plugin-appimage-$ARCH.AppImage"
-fetch "https://raw.githubusercontent.com/linuxdeploy/linuxdeploy-plugin-gtk/$GTK_PLUGIN_REV/linuxdeploy-plugin-gtk.sh" linuxdeploy-plugin-gtk.sh
-fetch "https://raw.githubusercontent.com/linuxdeploy/linuxdeploy-plugin-gstreamer/$GST_PLUGIN_REV/linuxdeploy-plugin-gstreamer.sh" linuxdeploy-plugin-gstreamer.sh
+# SHA-256 of each tool, as released at the tags and commits above (linuxdeploy publishes no
+# checksums itself; these were taken from the downloads). Bump them together with the versions.
+case "$ARCH" in
+    x86_64)
+        LINUXDEPLOY_SHA=c20cd71e3a4e3b80c3483cef793cda3f4e990aca14014d23c544ca3ce1270b4d
+        APPIMAGE_PLUGIN_SHA=992d502a248e14ab185448ddf6f6e7d25558cb84d4623c354c3af350c25fccb3 ;;
+    aarch64)
+        LINUXDEPLOY_SHA=620095110d693282b8ebeb244a95b5e911cf8f65f76c88b4b47d16ae6346fcff
+        APPIMAGE_PLUGIN_SHA=83c292149274965a865dcd44c135cfca8ba28c6b7de3eb628d4b8b5f248af17c ;;
+    *) echo "error: no linuxdeploy build for $ARCH" >&2; exit 1 ;;
+esac
+GTK_PLUGIN_SHA=b0f4cbc684a0103a9651f0955b635eaea0096b3a66c0f5a2c2aa337960375171
+GST_PLUGIN_SHA=d1cf90701047aa9583c274bb66dd82db352255374fbfb8f3c4c89a05fe23bce0
+
+# fetch <url> <name> <sha256>: downloads into $tools unless already there, and checks the hash.
+fetch() {
+    [ -f "$tools/$2" ] || curl -fsSL "$1" -o "$tools/$2"
+    echo "$3  $tools/$2" | sha256sum -c --quiet - || { echo "error: $2 does not match its expected checksum; delete $tools/$2 to fetch it again" >&2; exit 1; }
+    chmod +x "$tools/$2"
+}
+fetch "https://github.com/linuxdeploy/linuxdeploy/releases/download/$LINUXDEPLOY_REL/linuxdeploy-$ARCH.AppImage" "linuxdeploy-$ARCH.AppImage" "$LINUXDEPLOY_SHA"
+fetch "https://github.com/linuxdeploy/linuxdeploy-plugin-appimage/releases/download/$APPIMAGE_PLUGIN_REL/linuxdeploy-plugin-appimage-$ARCH.AppImage" "linuxdeploy-plugin-appimage-$ARCH.AppImage" "$APPIMAGE_PLUGIN_SHA"
+fetch "https://raw.githubusercontent.com/linuxdeploy/linuxdeploy-plugin-gtk/$GTK_PLUGIN_REV/linuxdeploy-plugin-gtk.sh" linuxdeploy-plugin-gtk.sh "$GTK_PLUGIN_SHA"
+fetch "https://raw.githubusercontent.com/linuxdeploy/linuxdeploy-plugin-gstreamer/$GST_PLUGIN_REV/linuxdeploy-plugin-gstreamer.sh" linuxdeploy-plugin-gstreamer.sh "$GST_PLUGIN_SHA"
 # No FUSE in containers.
 export APPIMAGE_EXTRACT_AND_RUN=1 PATH="$tools:$PATH"
 

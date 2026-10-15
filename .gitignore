@@ -2,7 +2,14 @@
 /.idea/
 
 /docs/
+
 /target
 /var/
 
+# Build outputs of packaging/*/build.sh, installer.sh and flatpak-builder.
+/dist/
+/build-flatpak/
+/.flatpak-builder/
+/repo/
+*.zsync
 packaging/flatpak/cargo-sources.json

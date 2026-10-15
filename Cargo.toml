@@ -6,6 +6,7 @@ members = ["crates/lapi", "crates/alibivms"]
 edition = "2024"
 version = "0.1.3"
 license = "Elastic-2.0"
+rust-version = "1.92"
 
 [workspace.dependencies]
 anyhow = "1"

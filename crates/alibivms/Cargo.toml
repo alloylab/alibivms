@@ -4,6 +4,7 @@ description = "Desktop viewer, playback and clip download for Alibi NVRs"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 lapi = { path = "../lapi" }
@@ -19,7 +20,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 bytes = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 zip = { version = "2", default-features = false }
-time = { version = "0.3", features = ["formatting", "macros", "local-offset"] }
+time = { version = "0.3", features = ["formatting", "macros"] }
 gtk = { package = "gtk4", version = "0.11", features = ["v4_14"] }
 adw = { package = "libadwaita", version = "0.9", features = ["v1_6"] }
 gst = { package = "gstreamer", version = "0.25" }
