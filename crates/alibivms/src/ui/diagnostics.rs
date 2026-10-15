@@ -12,8 +12,11 @@ use crate::{
     sites::Site,
 };
 
+/// A Star4Live probe: API path, request body, and which part of the answer to show.
+type CloudProbe = (&'static str, Value, Box<dyn Fn(&Value) -> Value + Send>);
+
 /// Runs each LAPI `GET` (and, for cloud sites, each Star4Live call) and formats the answers.
-async fn probe(site: Arc<Site>, lapi: Vec<String>, cloud: Vec<(&'static str, Value, Box<dyn Fn(&Value) -> Value + Send>)>) -> String {
+async fn probe(site: Arc<Site>, lapi: Vec<String>, cloud: Vec<CloudProbe>) -> String {
     let mut out = String::new();
     for uri in lapi {
         let r = site.client.raw("GET", &uri).await;
@@ -67,7 +70,7 @@ pub fn camera(app: &Rc<App>, cam: &Cam) {
         format!("/LAPI/V1.0/Channels/{n}/PTZ/Presets"),
     ];
     let serial = site.cfg.cloud.as_ref().map(|c| c.serial.clone()).unwrap_or_default();
-    let cloud: Vec<(&'static str, Value, Box<dyn Fn(&Value) -> Value + Send>)> = vec![(
+    let cloud: Vec<CloudProbe> = vec![(
         "/openapi/inner/device/channel/list",
         json!({ "deviceSerial": serial, "queryType": 0, "pageStart": 0, "pageSize": 100 }),
         Box::new(move |v: &Value| {
@@ -128,7 +131,7 @@ pub fn site(app: &Rc<App>, site_id: &str) {
     text.push_str("\n--- Probes ---\n");
     let lapi = vec!["/LAPI/V1.0/System/DeviceInfo".to_string(), "/LAPI/V1.0/Channels/System/DeviceInfos".to_string(), "/LAPI/V1.0/Network/WebSocketServer/Capabilities".to_string()];
     let serial = site.cfg.cloud.as_ref().map(|c| c.serial.clone()).unwrap_or_default();
-    let cloud: Vec<(&'static str, Value, Box<dyn Fn(&Value) -> Value + Send>)> = vec![(
+    let cloud: Vec<CloudProbe> = vec![(
         "/openapi/device/list",
         json!({ "pageNo": 1, "pageSize": 50 }),
         Box::new(move |v: &Value| v["deviceList"].as_array().and_then(|l| l.iter().find(|d| d["deviceSerial"].as_str() == Some(&serial)).cloned()).unwrap_or(Value::Null)),
@@ -149,6 +152,13 @@ fn present(app: &Rc<App>, title: &str, text: String, extra: Option<gtk::Widget>,
         body.append(&list);
     }
     body.append(&scroll);
+    let note = gtk::Label::builder()
+        .label("The text names the Star4Live account's e-mail, the NVR's and cameras' serial numbers and the cameras' IP addresses, but never a password.")
+        .wrap(true)
+        .xalign(0.0)
+        .css_classes(["dim-label", "caption"])
+        .build();
+    body.append(&note);
     body.append(&copy);
     let toolbar = adw::ToolbarView::new();
     toolbar.add_top_bar(&adw::HeaderBar::new());

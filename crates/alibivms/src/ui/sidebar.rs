@@ -25,6 +25,8 @@ pub struct Sidebar {
     seen: Cell<u64>,
     /// Sites the user has opened in this session; all start collapsed.
     expanded: Rc<RefCell<HashSet<String>>>,
+    /// The open camera menu, if any: parented to a row that a re-render destroys.
+    menu: Rc<glib::WeakRef<gtk::Popover>>,
     app: Rc<App>,
 }
 
@@ -44,7 +46,7 @@ impl Sidebar {
         root.append(&status);
         root.append(&scroll);
         root.append(&manage);
-        let sb = Rc::new(Self { root, list, filter, offline_only, status, seen: Cell::new(u64::MAX), expanded: Rc::default(), app: app.clone() });
+        let sb = Rc::new(Self { root, list, filter, offline_only, status, seen: Cell::new(u64::MAX), expanded: Rc::default(), menu: Rc::default(), app: app.clone() });
 
         let w = Rc::downgrade(&sb);
         sb.filter.connect_search_changed(move |_| if let Some(s) = w.upgrade() { s.render() });
@@ -74,6 +76,7 @@ impl Sidebar {
     }
 
     pub fn render(&self) {
+        close_menu(&self.menu);
         while let Some(c) = self.list.first_child() {
             self.list.remove(&c);
         }
@@ -286,10 +289,10 @@ impl Sidebar {
 
         // Right-click (or long-press) menu, built when asked for.
         let show_menu = {
-            let (app, cam, row) = (self.app.clone(), cam.clone(), row.downgrade());
+            let (app, cam, row, open) = (self.app.clone(), cam.clone(), row.downgrade(), self.menu.clone());
             move |x: f64, y: f64| {
                 if let Some(row) = row.upgrade() {
-                    camera_menu(&app, &cam, &row, local, x, y);
+                    camera_menu(&app, &cam, &row, local, x, y, &open);
                 }
             }
         };
@@ -348,8 +351,19 @@ impl Sidebar {
     }
 }
 
-/// "Rename…" / "Reset to NVR name" popover at (`x`, `y`) on a camera row.
-fn camera_menu(app: &Rc<App>, cam: &Cam, row: &adw::ActionRow, local: bool, x: f64, y: f64) {
+/// Closes and unparents the camera menu in `open`, if one is up.
+fn close_menu(open: &glib::WeakRef<gtk::Popover>) {
+    if let Some(p) = open.upgrade() {
+        p.popdown();
+        p.unparent();
+        open.set(None);
+    }
+}
+
+/// "Rename…" / "Reset to NVR name" popover at (`x`, `y`) on a camera row. `open` remembers it so
+/// the sidebar can close it before it destroys the row.
+fn camera_menu(app: &Rc<App>, cam: &Cam, row: &adw::ActionRow, local: bool, x: f64, y: f64, open: &glib::WeakRef<gtk::Popover>) {
+    close_menu(open);
     let menu = gtk::Box::builder().orientation(gtk::Orientation::Vertical).build();
     let rename = gtk::Button::builder().label("Rename…").css_classes(["flat"]).build();
     let reset = gtk::Button::builder().label("Reset to NVR name").css_classes(["flat"]).sensitive(local).build();
@@ -370,6 +384,7 @@ fn camera_menu(app: &Rc<App>, cam: &Cam, row: &adw::ActionRow, local: bool, x: f
     let pop = gtk::Popover::builder().child(&menu).has_arrow(false).position(gtk::PositionType::Bottom).build();
     pop.set_parent(row);
     pop.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+    open.set(Some(&pop));
     // Parented by hand, so unparented by hand once it has closed.
     pop.connect_closed(|p| {
         let p = p.clone();

@@ -137,10 +137,16 @@ impl Alerts {
         self.app.save_config();
     }
 
+    /// Hands the poller the config's watched set again, after the config changed behind its back
+    /// (an import, or a site removed).
+    pub fn resync(&self) {
+        *self.watched.write().unwrap() = self.app.cfg.borrow().motion_alerts.clone();
+    }
+
     fn push(self: &Rc<Self>, a: Alert) {
         let label = self.app.cam_label(&a.cam);
         tracing::info!(site = %a.cam.site, channel = a.cam.channel, begin = a.begin, "motion alert");
-        let t = adw::Toast::builder().title(format!("Motion: {}", glib::markup_escape_text(&label))).button_label("View").timeout(8).build();
+        let t = adw::Toast::builder().title(format!("Motion: {label}")).use_markup(false).button_label("View").timeout(8).build();
         let (w, cam) = (Rc::downgrade(self), a.cam.clone());
         t.connect_button_clicked(move |_| {
             if let Some(v) = w.upgrade() {
@@ -149,15 +155,15 @@ impl Alerts {
         });
         self.app.toasts.add_toast(t);
         // In-app toast while the window has focus; a desktop notification otherwise.
-        if !self.app.window.is_active() {
-            if let Some(application) = self.app.window.application() {
-                let target = format!("{}\u{1f}{}\u{1f}{}", a.cam.site, a.cam.channel, a.begin).to_variant();
-                let n = gio::Notification::new(&format!("Motion on {label}"));
-                n.set_body(Some(&format!("At {}", app::fmt_time(a.begin))));
-                n.set_default_action_and_target_value("app.motion-live", Some(&target));
-                n.add_button_with_target_value("Playback", "app.motion-playback", Some(&target));
-                application.send_notification(Some(&format!("motion-{}-{}", a.cam.site, a.cam.channel)), &n);
-            }
+        if !self.app.window.is_active()
+            && let Some(application) = self.app.window.application()
+        {
+            let target = format!("{}\u{1f}{}\u{1f}{}", a.cam.site, a.cam.channel, a.begin).to_variant();
+            let n = gio::Notification::new(&format!("Motion on {label}"));
+            n.set_body(Some(&format!("At {}", app::fmt_time(a.begin))));
+            n.set_default_action_and_target_value("app.motion-live", Some(&target));
+            n.add_button_with_target_value("Playback", "app.motion-playback", Some(&target));
+            application.send_notification(Some(&format!("motion-{}-{}", a.cam.site, a.cam.channel)), &n);
         }
         let mut recent = self.recent.borrow_mut();
         recent.push_front(a);

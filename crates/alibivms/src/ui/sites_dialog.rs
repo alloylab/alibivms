@@ -1,6 +1,9 @@
 //! Manage Star4Live accounts, sites (NVRs) and download settings.
 
-use std::rc::Rc;
+use std::{
+    cell::RefCell,
+    rc::{Rc, Weak},
+};
 
 use adw::prelude::*;
 use gtk::{gio, glib};
@@ -10,6 +13,10 @@ use crate::{
     audit::Entry,
     config::{CloudAccount, CloudLink, Config, SiteConfig, normalize_url},
 };
+
+/// Rebuilds the settings dialog's rows; handed (weakly, so the rows never keep it alive) to the
+/// dialogs that change sites.
+type Refill = Rc<RefCell<Option<Weak<dyn Fn()>>>>;
 
 /// The list of sites plus general settings.
 pub fn open(app: &Rc<App>) {
@@ -70,13 +77,15 @@ pub fn open(app: &Rc<App>) {
     dialog.set_title("Sites and settings");
     dialog.add(&page);
 
-    // Rebuilds the site rows; also handed to the edit/delete dialogs to call after a change.
-    let rows: Rc<std::cell::RefCell<Vec<adw::ActionRow>>> = Rc::default();
-    let account_rows: Rc<std::cell::RefCell<Vec<adw::ActionRow>>> = Rc::default();
-    let refill: Rc<std::cell::RefCell<Option<Rc<dyn Fn()>>>> = Rc::default();
+    // Rebuilds the site rows and resets the settings rows from the config; also handed to the
+    // edit/delete/import dialogs to call after a change.
+    let rows: Rc<RefCell<Vec<adw::ActionRow>>> = Rc::default();
+    let account_rows: Rc<RefCell<Vec<adw::ActionRow>>> = Rc::default();
+    let refill: Refill = Rc::default();
     let fill: Rc<dyn Fn()> = {
         let (app, sites, rows, refill) = (app.clone(), sites.clone(), rows.clone(), refill.clone());
         let (accounts, account_rows) = (accounts.clone(), account_rows.clone());
+        let (speed, thumbs, updates) = (speed.clone(), thumbs.clone(), updates.clone());
         Rc::new(move || {
             for r in rows.borrow_mut().drain(..) {
                 sites.remove(&r);
@@ -84,6 +93,14 @@ pub fn open(app: &Rc<App>) {
             for r in account_rows.borrow_mut().drain(..) {
                 accounts.remove(&r);
             }
+            // Read first: each row's handler writes the config back when its value changes.
+            let (scale, thumbs_on, updates_on) = {
+                let cfg = app.cfg.borrow();
+                (cfg.download_scale as f64, cfg.thumbnails, cfg.check_updates)
+            };
+            speed.set_value(scale);
+            thumbs.set_active(thumbs_on);
+            updates.set_active(updates_on);
             let again = refill.borrow().clone();
             for acc in app.cfg.borrow().cloud_accounts.clone() {
                 let n = app.cfg.borrow().sites.iter().filter(|s| s.cloud.as_ref().is_some_and(|c| c.account == acc.login_name)).count();
@@ -96,9 +113,9 @@ pub fn open(app: &Rc<App>) {
                 row.add_suffix(&pick);
                 row.add_suffix(&out);
                 let (a, name, again2) = (app.clone(), acc.login_name.clone(), again.clone());
-                pick.connect_clicked(move |_| pick_devices(&a, &name, again2.clone().unwrap_or_else(|| Rc::new(|| {}))));
+                pick.connect_clicked(move |b| pick_devices(&a, &name, b, upgrade(&again2).unwrap_or_else(|| Rc::new(|| {}))));
                 let (a, name, again2) = (app.clone(), acc.login_name.clone(), again.clone());
-                out.connect_clicked(move |_| confirm_sign_out(&a, &name, again2.clone()));
+                out.connect_clicked(move |_| confirm_sign_out(&a, &name, upgrade(&again2)));
                 accounts.add(&row);
                 account_rows.borrow_mut().push(row);
             }
@@ -108,15 +125,15 @@ pub fn open(app: &Rc<App>) {
                 row.add_suffix(&del);
                 row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
                 let (a, id, again2) = (app.clone(), s.id.clone(), again.clone());
-                row.connect_activated(move |_| edit(&a, Some(id.clone()), again2.clone()));
+                row.connect_activated(move |_| edit(&a, Some(id.clone()), upgrade(&again2)));
                 let (a, s2, again2) = (app.clone(), s.clone(), again.clone());
-                del.connect_clicked(move |_| confirm_delete(&a, &s2, again2.clone()));
+                del.connect_clicked(move |_| confirm_delete(&a, &s2, upgrade(&again2)));
                 sites.add(&row);
                 rows.borrow_mut().push(row);
             }
         })
     };
-    *refill.borrow_mut() = Some(fill.clone());
+    *refill.borrow_mut() = Some(Rc::downgrade(&fill));
     fill();
 
     let (a, f) = (app.clone(), fill.clone());
@@ -133,12 +150,12 @@ pub fn open(app: &Rc<App>) {
         let (a2, row) = (a.clone(), row.clone());
         let fd = gtk::FileDialog::builder().title("Save clips to").initial_folder(&gio::File::for_path(&a.cfg.borrow().download_dir)).build();
         fd.select_folder(Some(&a.window), gio::Cancellable::NONE, move |r| {
-            if let Ok(dir) = r {
-                if let Some(p) = dir.path() {
-                    row.set_subtitle(&p.display().to_string());
-                    a2.cfg.borrow_mut().download_dir = p;
-                    a2.save_config();
-                }
+            if let Ok(dir) = r
+                && let Some(p) = dir.path()
+            {
+                row.set_subtitle(&p.display().to_string());
+                a2.cfg.borrow_mut().download_dir = p;
+                a2.save_config();
             }
         });
     });
@@ -147,6 +164,23 @@ pub fn open(app: &Rc<App>) {
     let (a, f) = (app.clone(), fill.clone());
     import.connect_activated(move |_| import_settings(&a, f.clone()));
     dialog.present(Some(&app.window));
+}
+
+fn upgrade(f: &Option<Weak<dyn Fn()>>) -> Option<Rc<dyn Fn()>> {
+    f.as_ref().and_then(Weak::upgrade)
+}
+
+/// Tells the live view, the sidebar, the alerts poller and the thumbnails that sites or settings
+/// changed behind their backs.
+fn config_replaced(app: &Rc<App>) {
+    app.sites_changed();
+    if let Some(l) = app.live.borrow().as_ref() {
+        l.build();
+    }
+    if let Some(al) = app.alerts.borrow().as_ref() {
+        al.resync();
+    }
+    app.thumbnails.set_enabled(app.cfg.borrow().thumbnails);
 }
 
 fn json_filters() -> gio::ListStore {
@@ -243,10 +277,7 @@ fn import_settings(app: &Rc<App>, after: Rc<dyn Fn()>) {
                 detail: Some(format!("{} from {}: {sum:?}", if replace { "replace" } else { "merge" }, path.display())),
                 ..Default::default()
             });
-            a2.sites_changed();
-            if let Some(l) = a2.live.borrow().as_ref() {
-                l.build();
-            }
+            config_replaced(&a2);
             a2.cameras_renamed();
             after();
             let mut msg = format!("Imported: {} added, {} updated", plural(sum.sites_added, "site"), sum.sites_updated);
@@ -257,10 +288,27 @@ fn import_settings(app: &Rc<App>, after: Rc<dyn Fn()>) {
             if sum.without_password > 0 {
                 msg.push_str(&format!(". {} no password and will show offline until you edit {}", if sum.without_password == 1 { "1 site has" } else { "Some sites have" }, if sum.without_password == 1 { "it" } else { "them" }));
             }
+            if sum.accounts_missing > 0 {
+                msg.push_str(&format!(". {} a Star4Live account signed in before coming online", if sum.accounts_missing == 1 { "1 cloud site needs" } else { "Some cloud sites need" }));
+            }
             a2.toast(msg);
         });
         d.present(Some(&a.window));
     });
+}
+
+/// Drops sites from the config and from everything showing them, then saves.
+fn forget_sites(app: &Rc<App>, ids: &[String]) {
+    {
+        let mut cfg = app.cfg.borrow_mut();
+        for id in ids {
+            cfg.remove_site(id);
+        }
+    }
+    if let Some(p) = app.playback.borrow().as_ref() {
+        p.selection.borrow_mut().retain(|c| !ids.contains(&c.site));
+    }
+    config_replaced(app);
 }
 
 fn plural(n: usize, what: &str) -> String {
@@ -274,17 +322,8 @@ fn confirm_delete(app: &Rc<App>, site: &SiteConfig, after: Option<Rc<dyn Fn()>>)
     d.set_response_appearance("remove", adw::ResponseAppearance::Destructive);
     let (a, id) = (app.clone(), site.id.clone());
     d.connect_response(Some("remove"), move |_, _| {
-        a.cfg.borrow_mut().sites.retain(|s| s.id != id);
-        a.cfg.borrow_mut().live.iter_mut().for_each(|c| {
-            if c.as_ref().is_some_and(|c| c.site == id) {
-                *c = None;
-            }
-        });
+        forget_sites(&a, std::slice::from_ref(&id));
         a.audit.record(Entry { action: "site.remove", site: Some(id.clone()), ..Default::default() });
-        a.sites_changed();
-        if let Some(l) = a.live.borrow().as_ref() {
-            l.build();
-        }
         if let Some(f) = &after {
             f();
         }
@@ -474,6 +513,10 @@ pub fn cloud_sign_in(app: &Rc<App>, again: Option<String>, after: Rc<dyn Fn()>) 
         let (a, dialog, go, result) = (app.clone(), dialog.clone(), go.clone(), result.clone());
         let (user, pass) = (user.clone(), pass.clone());
         move || {
+            // Enter in the password row lands here too; one sign-in at a time.
+            if !go.is_sensitive() {
+                return;
+            }
             let name = user.text().trim().to_string();
             let pw = pass.text().to_string();
             if name.is_empty() || pw.is_empty() {
@@ -528,16 +571,21 @@ pub fn cloud_sign_in(app: &Rc<App>, again: Option<String>, after: Rc<dyn Fn()>) 
     dialog.present(Some(&app.window));
 }
 
-/// Lists the account's devices to add as sites.
-fn pick_devices(app: &Rc<App>, login_name: &str, after: Rc<dyn Fn()>) {
+/// Lists the account's devices to add as sites. `button` is the "Add NVRs…" that asked, held
+/// insensitive until the list is up so a second click can't open it twice.
+fn pick_devices(app: &Rc<App>, login_name: &str, button: &gtk::Button, after: Rc<dyn Fn()>) {
     let Some(account) = app.sites.account(login_name) else { return cloud_sign_in(app, Some(login_name.to_string()), after) };
-    let (a, name) = (app.clone(), login_name.to_string());
+    let (a, name, button) = (app.clone(), login_name.to_string(), button.clone());
+    button.set_sensitive(false);
     app.toast("Fetching devices…");
-    spawn_bg(async move { account.devices().await }, move |r| match r {
-        Ok(d) => show_devices(&a, &name, d, after.clone()),
-        Err(e) => {
-            a.toast(format!("Star4Live: {e}"));
-            cloud_sign_in(&a, Some(name.clone()), after.clone());
+    spawn_bg(async move { account.devices().await }, move |r| {
+        button.set_sensitive(true);
+        match r {
+            Ok(d) => show_devices(&a, &name, d, after.clone()),
+            Err(e) => {
+                a.toast(format!("Star4Live: {e}"));
+                cloud_sign_in(&a, Some(name.clone()), after.clone());
+            }
         }
     });
 }
@@ -577,7 +625,9 @@ fn show_devices(app: &Rc<App>, login_name: &str, devices: Vec<lapi::cloud::Devic
         {
             let mut cfg = a.cfg.borrow_mut();
             for (check, d) in &checks {
-                if !check.is_active() || !check.is_sensitive() {
+                // Added since the list was made (by another copy of this dialog) counts too.
+                let present = cfg.sites.iter().any(|s| s.cloud.as_ref().is_some_and(|c| c.account == name && c.serial == d.serial));
+                if !check.is_active() || !check.is_sensitive() || present {
                     continue;
                 }
                 let id = cfg.new_site_id(&d.name);
@@ -604,22 +654,13 @@ fn confirm_sign_out(app: &Rc<App>, login_name: &str, after: Option<Rc<dyn Fn()>>
     d.set_response_appearance("out", adw::ResponseAppearance::Destructive);
     let (a, name) = (app.clone(), login_name.to_string());
     d.connect_response(Some("out"), move |_, _| {
-        {
+        let gone: Vec<String> = {
             let mut cfg = a.cfg.borrow_mut();
-            let gone: Vec<String> = cfg.sites.iter().filter(|s| s.cloud.as_ref().is_some_and(|c| c.account == name)).map(|s| s.id.clone()).collect();
-            cfg.sites.retain(|s| !gone.contains(&s.id));
             cfg.cloud_accounts.retain(|c| c.login_name != name);
-            cfg.live.iter_mut().for_each(|c| {
-                if c.as_ref().is_some_and(|c| gone.contains(&c.site)) {
-                    *c = None;
-                }
-            });
-        }
+            cfg.sites.iter().filter(|s| s.cloud.as_ref().is_some_and(|c| c.account == name)).map(|s| s.id.clone()).collect()
+        };
+        forget_sites(&a, &gone);
         a.audit.record(Entry { action: "cloud.sign_out", detail: Some(name.clone()), ..Default::default() });
-        a.sites_changed();
-        if let Some(l) = a.live.borrow().as_ref() {
-            l.build();
-        }
         if let Some(f) = &after {
             f();
         }
