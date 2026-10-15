@@ -118,10 +118,10 @@ async fn run(sites: Sites, watched: Watched, tx: tokio::sync::mpsc::UnboundedSen
                 match r {
                     Ok(segs) => {
                         let cam = Cam { site: id.clone(), channel };
-                        if let Some(a) = tracker.feed(&cam, &segs, now()) {
-                            if tx.send(a).is_err() {
-                                return;
-                            }
+                        if let Some(a) = tracker.feed(&cam, &segs, now())
+                            && tx.send(a).is_err()
+                        {
+                            return;
                         }
                     }
                     Err(e) => {

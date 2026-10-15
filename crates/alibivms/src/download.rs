@@ -4,6 +4,7 @@
 
 use std::{
     collections::HashMap,
+    io::{Read, Write},
     path::{Path, PathBuf},
     process::Stdio,
     sync::{Arc, Mutex},
@@ -13,13 +14,14 @@ use std::{
 use anyhow::{Context, bail};
 use lapi::Stream;
 use serde::Serialize;
-use tokio::{io::AsyncBufReadExt, process::Command};
+use tokio::{io::AsyncBufReadExt, process::Command, time::Instant};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::{
-    sites::{Site, Sites, now},
-};
+use crate::sites::{Site, Sites, now};
+
+/// Below this an output file holds no usable video.
+const MIN_SIZE: u64 = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -39,6 +41,9 @@ pub struct ChannelProgress {
     pub progress: f32,
     pub done: bool,
     pub error: Option<String>,
+    /// The clip was saved but holds less than was asked for (the pull was cut short, or the
+    /// recording ends before the range does).
+    pub warning: Option<String>,
     /// Pull rate as a multiple of real time, while running.
     pub speed: Option<f32>,
 }
@@ -87,6 +92,15 @@ impl Job {
 
     fn update(&self, f: impl FnOnce(&mut JobView)) {
         f(&mut self.view.lock().unwrap());
+    }
+
+    /// Runs `fut` unless the job is cancelled first. Only for steps that leave nothing behind
+    /// when dropped half-way (requests, child processes with `kill_on_drop`).
+    async fn until_cancelled<T>(&self, fut: impl Future<Output = anyhow::Result<T>>) -> anyhow::Result<T> {
+        match self.cancel.run_until_cancelled(fut).await {
+            Some(r) => r,
+            None => bail!("cancelled"),
+        }
     }
 }
 
@@ -149,7 +163,7 @@ impl Downloads {
                 Some(n) => n.clone(),
                 None => site.channel(*ch).map(|c| c.name).unwrap_or_else(|| format!("Channel {ch}")),
             };
-            channels.push(ChannelProgress { channel: *ch, name, progress: 0.0, done: false, error: None, speed: None });
+            channels.push(ChannelProgress { channel: *ch, name, progress: 0.0, done: false, error: None, warning: None, speed: None });
         }
         let job = Arc::new(Job {
             view: Mutex::new(JobView {
@@ -176,15 +190,12 @@ impl Downloads {
         self.jobs.lock().unwrap().insert(id, job.clone());
         let this = self.clone();
         let j = job.clone();
+        // `run` notices cancellation itself rather than being dropped mid-way, so the file
+        // copies and the zip writer it runs on blocking threads are over before the job dir goes.
         tokio::spawn(async move {
-            let r = tokio::select! {
-                r = this.run(&site, &j, scale) => r,
-                _ = j.cancel.cancelled() => Err(anyhow::anyhow!("cancelled")),
-            };
-            match r {
+            match this.run(&site, &j, scale).await {
                 Ok(()) => j.update(|v| v.status = Status::Ready),
-                Err(e) if j.cancel.is_cancelled() => {
-                    let _ = e;
+                Err(_) if j.cancel.is_cancelled() => {
                     j.update(|v| v.status = Status::Cancelled);
                     let _ = tokio::fs::remove_dir_all(&j.dir).await;
                 }
@@ -243,7 +254,7 @@ impl Downloads {
         let view = job.view();
         let mut outputs = Vec::new();
         for (idx, ch) in view.channels.iter().enumerate() {
-            let _slot = site.download_slots.acquire().await?;
+            let _slot = job.until_cancelled(async { Ok(site.download_slots.acquire().await?) }).await?;
             job.update(|v| v.status = Status::Running);
             let base = format!(
                 "{}_{}_{}",
@@ -276,6 +287,9 @@ impl Downloads {
         if outputs.is_empty() {
             bail!("no camera produced video for that range");
         }
+        if job.cancel.is_cancelled() {
+            bail!("cancelled");
+        }
         // Describe the clip while the MP4s are still loose; a missing thumbnail is not an error.
         let duration = self.probe_duration(&outputs[0]).await.ok();
         let thumb = self.thumbs.join(format!("{}.png", view.id));
@@ -296,8 +310,8 @@ impl Downloads {
             outputs.pop().unwrap()
         } else {
             let zip_path = job.dir.join(format!("{}_{}_{}cams.zip", sanitize(&site.cfg.id), stamp(view.begin), outputs.len()));
-            let zp = zip_path.clone();
-            tokio::task::spawn_blocking(move || write_zip(&zp, &outputs)).await??;
+            let (zp, cancel) = (zip_path.clone(), job.cancel.clone());
+            tokio::task::spawn_blocking(move || write_zip(&zp, &outputs, &cancel)).await??;
             zip_path
         };
         let size = tokio::fs::metadata(&file).await?.len();
@@ -305,8 +319,19 @@ impl Downloads {
         tokio::fs::create_dir_all(dest).await.with_context(|| format!("creating {}", dest.display()))?;
         let final_path = unique_path(&dest.join(file.file_name().unwrap()));
         if tokio::fs::rename(&file, &final_path).await.is_err() {
-            // Different filesystem: copy, then drop the temp copy.
-            tokio::fs::copy(&file, &final_path).await.with_context(|| format!("saving to {}", final_path.display()))?;
+            // Different filesystem: copy to a `.part` next to the destination, then rename, so a
+            // cancelled or failed copy never leaves a half file under the final name.
+            let part = unique_path(&final_path.with_file_name(format!("{}.part", final_path.file_name().unwrap().to_string_lossy())));
+            let (src, dst, cancel) = (file.clone(), part.clone(), job.cancel.clone());
+            let copied = tokio::task::spawn_blocking(move || copy_file(&src, &dst, &cancel)).await?;
+            let moved = match copied {
+                Ok(()) => tokio::fs::rename(&part, &final_path).await.map_err(anyhow::Error::from),
+                Err(e) => Err(e),
+            };
+            if let Err(e) = moved {
+                let _ = tokio::fs::remove_file(&part).await;
+                return Err(e).with_context(|| format!("saving to {}", final_path.display()));
+            }
         }
         let _ = tokio::fs::remove_dir_all(&job.dir).await;
         job.update(|v| {
@@ -330,38 +355,50 @@ impl Downloads {
         out: &Path,
     ) -> anyhow::Result<()> {
         let duration = (end - begin) as f64;
-        let url = site.client.record_url(channel, begin, end, stream).await?;
+        let url = job.until_cancelled(async { Ok(site.client.record_url(channel, begin, end, stream).await?) }).await?;
         let raw = out.with_extension("mkv");
 
-        // Pull at `scale`; fall back to real time if the NVR sends nothing usable that way.
+        // Pull at `scale`; fall back to real time only if the NVR sends nothing usable that way.
+        // Once something is on disk it is kept: starting over would most likely stop at the same
+        // place, and the user can see what was saved.
         let mut scale = scale;
-        loop {
-            let media = site.media(url.clone(), Some(scale), true).await?;
-            let r = self.capture(&media.url, &raw, duration, scale, |p, s| {
+        let warning = loop {
+            let media = job.until_cancelled(site.media(url.clone(), Some(scale), true)).await?;
+            let c = self.capture(&media.url, &raw, duration, &job.cancel, |p, s| {
                 job.update(|v| {
                     v.channels[idx].progress = p * 0.95;
                     v.channels[idx].speed = s;
                 })
             })
-            .await;
-            match r {
-                Ok(()) => break,
+            .await?;
+            if job.cancel.is_cancelled() {
+                bail!("cancelled");
+            }
+            match c.verdict(duration) {
+                Ok(w) => break w,
                 Err(e) if scale > 1 => {
-                    tracing::warn!(channel, scale, error = %format!("{e:#}"), "fast pull failed, retrying at real time");
+                    tracing::warn!(channel, scale, error = %e, "fast pull got nothing, retrying at real time");
                     scale = 1;
                 }
-                Err(e) => return Err(e),
+                Err(e) => bail!("{e}"),
             }
+        };
+        if let Some(w) = &warning {
+            tracing::warn!(channel, warning = %w, "clip saved with less than asked");
         }
-        job.update(|v| v.channels[idx].speed = None);
-        self.finalize(&raw, out).await?;
+        job.update(|v| {
+            v.channels[idx].speed = None;
+            v.channels[idx].warning = warning;
+        });
+        job.until_cancelled(self.finalize(&raw, out)).await?;
         let _ = tokio::fs::remove_file(&raw).await;
         Ok(())
     }
 
     /// Copies the replay stream into a Matroska file, which takes any codec the NVR sends.
     /// `progress` gets the fraction done and the pull rate (× real time) once per ffmpeg report.
-    async fn capture(&self, input: &str, raw: &Path, duration: f64, scale: u32, progress: impl Fn(f32, Option<f32>)) -> anyhow::Result<()> {
+    /// Returns what ffmpeg left behind, however it stopped; only failing to run it is an error.
+    async fn capture(&self, input: &str, raw: &Path, duration: f64, cancel: &CancellationToken, progress: impl Fn(f32, Option<f32>)) -> anyhow::Result<Captured> {
         let mut cmd = tool(&self.ffmpeg);
         cmd.args(["-hide_banner", "-loglevel", "error", "-nostdin", "-nostats", "-y"])
             .args(["-rtsp_transport", "tcp", "-timeout", "15000000", "-i", input])
@@ -387,40 +424,53 @@ impl Downloads {
             last.join("; ")
         });
         let mut lines = tokio::io::BufReader::new(child.stdout.take().unwrap()).lines();
-        // Budget: real time divided by scale, plus generous slack for NVR start-up.
-        let budget = Duration::from_secs_f64(duration / scale as f64 * 1.5 + 60.0);
-        let mut last_progress = tokio::time::Instant::now();
+        // Until the pull rate is known, allow for the NVR ignoring `Scale` and sending at real
+        // time; after a few reports the budget follows the rate actually seen.
+        let mut deadline = Instant::now() + Duration::from_secs_f64(duration * 1.5 + 60.0);
         let stall = Duration::from_secs(30);
-        let deadline = tokio::time::Instant::now() + budget;
-        let (mut done, mut speed) = (0.0, None);
+        let mut last_progress = Instant::now();
+        let (mut secs, mut speed, mut reports) = (0.0f64, None, 0u32);
+        let mut stopped = None;
         loop {
-            let line = tokio::time::timeout_at(deadline.min(last_progress + stall), lines.next_line()).await;
+            let line = tokio::select! {
+                l = tokio::time::timeout_at(deadline.min(last_progress + stall), lines.next_line()) => l,
+                _ = cancel.cancelled() => {
+                    stopped = Some("cancelled".to_string());
+                    break;
+                }
+            };
             match line {
-                Err(_) => bail!("NVR stopped sending video"),
+                Err(_) => {
+                    stopped = Some(if Instant::now() >= deadline { "pull fell far behind its rate" } else { "NVR stopped sending video" }.to_string());
+                    break;
+                }
                 Ok(Ok(None)) => break,
                 Ok(Err(e)) => return Err(e.into()),
-                Ok(Ok(Some(l))) => {
-                    if let Some(us) = l.strip_prefix("out_time_us=").and_then(|v| v.parse::<f64>().ok()) {
-                        last_progress = tokio::time::Instant::now();
-                        done = ((us / 1e6) / duration).clamp(0.0, 1.0) as f32;
-                    } else if let Some(v) = l.strip_prefix("speed=") {
-                        speed = parse_speed(v);
-                    } else if l.starts_with("progress=") {
-                        progress(done, speed);
+                Ok(Ok(Some(l))) => match progress_line(&l) {
+                    Some(Progress::Time(t)) => {
+                        last_progress = Instant::now();
+                        secs = t;
                     }
-                }
+                    Some(Progress::Speed(s)) => speed = s,
+                    Some(Progress::Report) => {
+                        reports += 1;
+                        progress((secs / duration).clamp(0.0, 1.0) as f32, speed);
+                        if reports >= 3 && let Some(s) = speed {
+                            deadline = Instant::now() + Duration::from_secs_f64((duration - secs).max(0.0) / s as f64 * 2.0 + 30.0);
+                        }
+                    }
+                    None => {}
+                },
             }
         }
+        if stopped.is_some() {
+            let _ = child.start_kill();
+        }
         let status = child.wait().await?;
-        let err = errors.await.unwrap_or_default();
+        let stderr = errors.await.unwrap_or_default();
         let size = tokio::fs::metadata(raw).await.map(|m| m.len()).unwrap_or(0);
-        if !status.success() && size == 0 {
-            bail!("ffmpeg failed: {err}");
-        }
-        if size < 1024 {
-            bail!("no video recorded in that range{}", if err.is_empty() { String::new() } else { format!(" ({err})") });
-        }
-        Ok(())
+        let clean = status.success() && stopped.is_none();
+        Ok(Captured { secs, size, clean, reason: stopped.unwrap_or_else(|| format!("ffmpeg failed: {stderr}")), stderr })
     }
 
     /// Remuxes to MP4: video copied, audio converted to AAC (MP4 cannot carry G.711), H.265
@@ -481,9 +531,73 @@ impl Downloads {
     }
 }
 
+/// What one ffmpeg run left on disk.
+struct Captured {
+    /// Media seconds written, per ffmpeg's last progress report.
+    secs: f64,
+    size: u64,
+    /// ffmpeg finished on its own: the range was reached, or the recording ended first.
+    clean: bool,
+    /// Why it stopped otherwise: ours (stall, budget, cancel) or ffmpeg's exit with its stderr.
+    reason: String,
+    stderr: String,
+}
+
+impl Captured {
+    /// Whether the file is worth keeping, and what to tell the user: nothing usable is an
+    /// error (the caller may retry); an interrupted pull keeps what it got with a warning; a
+    /// clean finish well short of `wanted` seconds means the recording ends early.
+    fn verdict(&self, wanted: f64) -> Result<Option<String>, String> {
+        if self.size < MIN_SIZE || self.secs <= 0.0 {
+            return Err(match (self.clean, self.stderr.is_empty()) {
+                (false, _) => self.reason.clone(),
+                (true, true) => "no video recorded in that range".into(),
+                (true, false) => format!("no video recorded in that range ({})", self.stderr),
+            });
+        }
+        let (got, all) = (clock(self.secs), clock(wanted));
+        if !self.clean {
+            Ok(Some(format!("stopped early, {got} of {all} saved: {}", self.reason)))
+        } else if wanted - self.secs > (wanted * 0.05).max(5.0) {
+            Ok(Some(format!("recording is shorter than the range: {got} of {all} saved")))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+/// One line of ffmpeg's `-progress` output that matters.
+enum Progress {
+    /// `out_time_us=`, as seconds.
+    Time(f64),
+    /// `speed=`, `None` while ffmpeg has no estimate.
+    Speed(Option<f32>),
+    /// `progress=`: the end of one report.
+    Report,
+}
+
+fn progress_line(l: &str) -> Option<Progress> {
+    if let Some(us) = l.strip_prefix("out_time_us=") {
+        return us.trim().parse::<f64>().ok().map(|us| Progress::Time((us / 1e6).max(0.0)));
+    }
+    if let Some(v) = l.strip_prefix("speed=") {
+        return Some(Progress::Speed(parse_speed(v)));
+    }
+    l.starts_with("progress=").then_some(Progress::Report)
+}
+
 /// ffmpeg's `speed=2.03x` value; `N/A` while it has no estimate.
 fn parse_speed(v: &str) -> Option<f32> {
     v.trim().trim_end_matches('x').parse().ok().filter(|s: &f32| s.is_finite() && *s > 0.0)
+}
+
+/// `1:02:03` or `4:05`.
+fn clock(secs: f64) -> String {
+    let s = secs.round().max(0.0) as i64;
+    match (s / 3600, s % 3600 / 60, s % 60) {
+        (0, m, sec) => format!("{m}:{sec:02}"),
+        (h, m, sec) => format!("{h}:{m:02}:{sec:02}"),
+    }
 }
 
 /// The first, human part of an error chain (`ffmpeg failed: <stderr>` → `ffmpeg failed`).
@@ -547,8 +661,7 @@ pub fn stamp(t: i64) -> String {
         .unwrap_or_else(|| t.to_string())
 }
 
-fn write_zip(path: &Path, files: &[PathBuf]) -> anyhow::Result<()> {
-    use std::io::Write;
+fn write_zip(path: &Path, files: &[PathBuf], cancel: &CancellationToken) -> anyhow::Result<()> {
     let mut z = zip::ZipWriter::new(std::fs::File::create(path)?);
     // Video is already compressed; storing avoids burning CPU for nothing.
     let opts = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored).large_file(true);
@@ -556,12 +669,37 @@ fn write_zip(path: &Path, files: &[PathBuf]) -> anyhow::Result<()> {
         let name = f.file_name().unwrap().to_string_lossy();
         z.start_file(name, opts)?;
         let mut src = std::fs::File::open(f)?;
-        std::io::copy(&mut src, &mut z)?;
+        pump(&mut src, &mut z, cancel)?;
         drop(src);
         std::fs::remove_file(f)?;
     }
     z.finish()?.flush()?;
     Ok(())
+}
+
+/// A plain copy on a blocking thread that gives up when the job is cancelled; the caller
+/// removes `dst` on error.
+fn copy_file(src: &Path, dst: &Path, cancel: &CancellationToken) -> anyhow::Result<()> {
+    let mut from = std::fs::File::open(src)?;
+    let mut to = std::fs::File::create(dst)?;
+    pump(&mut from, &mut to, cancel)?;
+    to.flush()?;
+    Ok(())
+}
+
+/// `std::io::copy` that checks `cancel` between chunks.
+fn pump(from: &mut impl Read, to: &mut impl Write, cancel: &CancellationToken) -> anyhow::Result<()> {
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        if cancel.is_cancelled() {
+            bail!("cancelled");
+        }
+        let n = from.read(&mut buf)?;
+        if n == 0 {
+            return Ok(());
+        }
+        to.write_all(&buf[..n])?;
+    }
 }
 
 #[cfg(test)]
@@ -579,5 +717,45 @@ mod tests {
         assert_eq!(short_reason("ffmpeg failed: [rtsp] 404 Not Found"), "ffmpeg failed");
         assert_eq!(short_reason("no video recorded in that range (x: y)"), "no video recorded in that range");
         assert_eq!(short_reason("NVR stopped sending video"), "NVR stopped sending video");
+        assert_eq!(clock(65.0), "1:05");
+        assert_eq!(clock(3723.4), "1:02:03");
+    }
+
+    #[test]
+    fn progress_lines() {
+        assert!(matches!(progress_line("out_time_us=1500000"), Some(Progress::Time(t)) if t == 1.5));
+        assert!(matches!(progress_line("out_time_us=-2000"), Some(Progress::Time(t)) if t == 0.0));
+        assert!(progress_line("out_time_us=N/A").is_none());
+        assert!(matches!(progress_line("speed=4.2x"), Some(Progress::Speed(Some(s))) if s == 4.2));
+        assert!(matches!(progress_line("speed=N/A"), Some(Progress::Speed(None))));
+        assert!(matches!(progress_line("progress=continue"), Some(Progress::Report)));
+        assert!(progress_line("frame=12").is_none());
+    }
+
+    #[test]
+    fn verdicts() {
+        let c = |secs, size, clean, reason: &str| Captured { secs, size, clean, reason: reason.into(), stderr: String::new() };
+        // Nothing usable: an error, whatever ffmpeg said.
+        assert_eq!(c(0.0, 0, false, "ffmpeg failed: 404").verdict(600.0), Err("ffmpeg failed: 404".into()));
+        assert_eq!(c(0.0, 0, true, "").verdict(600.0), Err("no video recorded in that range".into()));
+        assert!(c(300.0, 500, true, "").verdict(600.0).is_err());
+        // Whole range, or a frame short of it.
+        assert_eq!(c(599.0, 1 << 20, true, "").verdict(600.0), Ok(None));
+        // The recording ends before the range does.
+        let w = c(300.0, 1 << 20, true, "").verdict(600.0).unwrap().unwrap();
+        assert!(w.starts_with("recording is shorter than the range: 5:00 of 10:00"), "{w}");
+        // Interrupted: kept, but said so.
+        let w = c(300.0, 1 << 20, false, "NVR stopped sending video").verdict(600.0).unwrap().unwrap();
+        assert_eq!(w, "stopped early, 5:00 of 10:00 saved: NVR stopped sending video");
+    }
+
+    #[test]
+    fn cancelled_copy_stops() {
+        let cancel = CancellationToken::new();
+        let mut out = Vec::new();
+        assert!(pump(&mut &b"abc"[..], &mut out, &cancel).is_ok());
+        assert_eq!(out, b"abc");
+        cancel.cancel();
+        assert!(pump(&mut &b"abc"[..], &mut out, &cancel).is_err());
     }
 }

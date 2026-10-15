@@ -168,7 +168,8 @@ mod base64_lite {
 
 struct Shared {
     creds: Credentials,
-    /// `rtsp://127.0.0.1:<port>` as the player sees it, and the NVR's own origin it stands for.
+    /// `rtsp://127.0.0.1:<port>/<token>` as the player sees it, and the NVR's own origin it
+    /// stands for.
     local_origin: String,
     upstream_origin: String,
     scale: Option<u32>,
@@ -190,11 +191,11 @@ impl Shared {
         let mut head = without_header(&head, "Authorization");
         let mut parts = head.lines().next().unwrap_or_default().split_whitespace();
         let (method, uri) = (parts.next().unwrap_or_default().to_string(), parts.next().unwrap_or_default().to_string());
-        if method == "PLAY" {
-            if let Some(scale) = self.scale.filter(|s| *s > 1) {
-                head = without_header(&head, "Scale");
-                head.push_str(&format!("\r\nScale: {scale}.000"));
-            }
+        if method == "PLAY"
+            && let Some(scale) = self.scale.filter(|s| *s > 1)
+        {
+            head = without_header(&head, "Scale");
+            head.push_str(&format!("\r\nScale: {scale}.000"));
         }
         if let Some(ch) = &self.challenge {
             self.nc += 1;
@@ -243,7 +244,9 @@ impl Upstream {
 }
 
 pub struct Proxy {
-    /// `rtsp://127.0.0.1:<port>/<path>` for the player; carries no credentials.
+    /// `rtsp://127.0.0.1:<port>/<token>/<path>` for the player; carries no credentials. The
+    /// random token is what lets the proxy tell its player from any other local process that
+    /// finds the port.
     pub local_url: String,
     task: JoinHandle<()>,
 }
@@ -255,15 +258,17 @@ impl Drop for Proxy {
 }
 
 /// Connects to `upstream`, then starts a proxy for it and returns the URL the player should
-/// open. The proxy serves exactly one connection. Connecting first keeps a slow upstream (the
-/// cloud relay takes several seconds to set up) out of the player's own response timeout, and
-/// reports its failures as they are rather than as an RTSP timeout.
+/// open. The proxy serves exactly one connection, and only to a client that presents the URL's
+/// random token in its first request: anything else on the machine that finds the port is
+/// dropped before it can reach the NVR with our credentials. Connecting first keeps a slow
+/// upstream (the cloud relay takes several seconds to set up) out of the player's own response
+/// timeout, and reports its failures as they are rather than as an RTSP timeout.
 pub async fn start(upstream: Upstream, scale: Option<u32>) -> anyhow::Result<Proxy> {
     let target = upstream.url().to_string();
     let url = url_parts(&target).with_context(|| format!("not an rtsp url: {target}"))?;
     let conn = upstream.connect().await?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let local_origin = format!("rtsp://{}", listener.local_addr()?);
+    let local_origin = format!("rtsp://{}/{:016x}{:016x}", listener.local_addr()?, rand::random::<u64>(), rand::random::<u64>());
     let local_url = format!("{local_origin}{}", url.path);
     let upstream_origin = target.strip_suffix(url.path.as_str()).unwrap_or(&target).to_string();
     let task = tokio::spawn(async move {
@@ -313,10 +318,18 @@ async fn relay(client: TcpStream, (ur, uw, creds): (Reader, Writer, Credentials)
     }));
 
     let up = {
-        let (uw, shared) = (uw.clone(), shared.clone());
+        let (uw, shared, local_origin) = (uw.clone(), shared.clone(), local_origin.clone());
         async move {
             let mut cr = BufReader::new(cr);
+            let mut first = true;
             while let Some(msg) = read_message(&mut cr).await? {
+                if first {
+                    // Nothing goes upstream for a client that does not know the token.
+                    match &msg {
+                        Message::Text { head, .. } if authorised(head, &local_origin) => first = false,
+                        _ => bail!("client without the proxy token"),
+                    }
+                }
                 match msg {
                     Message::Data(d) => uw.lock().await.write_all(&d).await?,
                     Message::Text { head, body } => {
@@ -358,6 +371,12 @@ async fn relay(client: TcpStream, (ur, uw, creds): (Reader, Writer, Credentials)
     let _ = uw.lock().await.shutdown().await;
     let _ = cw.lock().await.shutdown().await;
     r
+}
+
+/// Whether a request's URI is under `local_origin`, i.e. carries this proxy's token.
+fn authorised(head: &str, local_origin: &str) -> bool {
+    let uri = head.lines().next().and_then(|l| l.split_whitespace().nth(1)).unwrap_or_default();
+    uri.strip_prefix(local_origin).is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
 }
 
 /// Points URLs in a response's headers (`Content-Base`, `Content-Location`) back at the proxy.
@@ -434,6 +453,39 @@ mod tests {
     fn content_base_points_back_at_proxy() {
         let h = localize("RTSP/1.0 200 OK\r\nCSeq: 2\r\nContent-Base: rtsp://127.0.0.1:554/c2/s1/live/", "rtsp://127.0.0.1:554", "rtsp://127.0.0.1:4000");
         assert_eq!(h, "RTSP/1.0 200 OK\r\nCSeq: 2\r\nContent-Base: rtsp://127.0.0.1:4000/c2/s1/live/");
+    }
+
+    #[test]
+    fn only_the_token_holder_gets_through() {
+        let origin = "rtsp://127.0.0.1:4000/0123456789abcdef0123456789abcdef";
+        assert!(authorised("OPTIONS rtsp://127.0.0.1:4000/0123456789abcdef0123456789abcdef/c1/ RTSP/1.0\r\nCSeq: 1", origin));
+        assert!(authorised("OPTIONS rtsp://127.0.0.1:4000/0123456789abcdef0123456789abcdef RTSP/1.0", origin));
+        assert!(!authorised("OPTIONS rtsp://127.0.0.1:4000/c1/ RTSP/1.0\r\nCSeq: 1", origin));
+        assert!(!authorised("OPTIONS rtsp://127.0.0.1:4000/0123456789abcdef0123456789abcdee/c1/ RTSP/1.0", origin));
+        assert!(!authorised("OPTIONS rtsp://127.0.0.1:4000/0123456789abcdef0123456789abcdef0/ RTSP/1.0", origin));
+        assert!(!authorised("OPTIONS * RTSP/1.0", origin));
+        assert!(!authorised("", origin));
+    }
+
+    #[tokio::test]
+    async fn token_is_in_the_url_and_stripped_upstream() {
+        // A proxy to an upstream that never answers; only the URL shape and the gate matter.
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = format!("rtsp://{}/c1/replay/", upstream.local_addr().unwrap());
+        let creds = Credentials { username: "u".into(), password: "p".into() };
+        let p = start(Upstream::Direct { url: target.clone(), creds }, None).await.unwrap();
+        let (_us, _) = upstream.accept().await.unwrap();
+        let rest = p.local_url.strip_prefix("rtsp://127.0.0.1:").unwrap();
+        let (_port, path) = rest.split_once('/').unwrap();
+        let (token, tail) = path.split_once('/').unwrap();
+        assert_eq!(token.len(), 32, "{}", p.local_url);
+        assert_eq!(tail, "c1/replay/");
+        // A client without the token is cut off without a reply.
+        let mut c = TcpStream::connect(p.local_url.strip_prefix("rtsp://").unwrap().split_once('/').unwrap().0).await.unwrap();
+        c.write_all(b"OPTIONS rtsp://127.0.0.1:1/c1/replay/ RTSP/1.0\r\nCSeq: 1\r\n\r\n").await.unwrap();
+        let mut buf = Vec::new();
+        let n = timeout(Duration::from_secs(5), c.read_to_end(&mut buf)).await.expect("closed").unwrap();
+        assert_eq!(n, 0);
     }
 
     #[test]

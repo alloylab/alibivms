@@ -1,6 +1,12 @@
 //! Downloads page: progress of clip exports and quick access to the saved files.
 
-use std::{cell::RefCell, path::Path, rc::Rc, time::Duration};
+use std::{
+    cell::{Cell, RefCell},
+    collections::HashMap,
+    path::Path,
+    rc::Rc,
+    time::Duration,
+};
 
 use adw::prelude::*;
 use gtk::{gio, glib};
@@ -12,6 +18,9 @@ use crate::{
     download::{self, JobView, Status},
 };
 
+/// How often saved files are checked for still being there, in refresh ticks (seconds).
+const FILE_CHECK_EVERY: u32 = 30;
+
 pub struct DownloadsView {
     pub root: gtk::Box,
     list: gtk::ListBox,
@@ -19,6 +28,12 @@ pub struct DownloadsView {
     stack: gtk::Stack,
     /// Per shown job: what its row was built from, and the widgets that change while it runs.
     rows: RefCell<Vec<(Uuid, String, Option<Live>)>>,
+    /// Whether each finished job's file is still where it was saved. Checked off the main
+    /// thread now and then (a dead network share would otherwise freeze the window), so a
+    /// job not listed here is taken to be intact: it was just written.
+    present: RefCell<HashMap<Uuid, bool>>,
+    checking: Cell<bool>,
+    ticks: Cell<u32>,
     app: Rc<App>,
 }
 
@@ -56,7 +71,17 @@ impl DownloadsView {
         root.append(&bar);
         root.append(&stack);
 
-        let view = Rc::new(Self { root, list, empty, stack, rows: RefCell::default(), app: app.clone() });
+        let view = Rc::new(Self {
+            root,
+            list,
+            empty,
+            stack,
+            rows: RefCell::default(),
+            present: RefCell::default(),
+            checking: Cell::new(false),
+            ticks: Cell::new(0),
+            app: app.clone(),
+        });
         let a = app.clone();
         open_folder.connect_clicked(move |_| {
             let dir = a.cfg.borrow().download_dir.clone();
@@ -74,10 +99,50 @@ impl DownloadsView {
         glib::timeout_add_local(Duration::from_millis(1000), move || {
             let Some(v) = w.upgrade() else { return glib::ControlFlow::Break };
             v.refresh();
+            let t = v.ticks.get().wrapping_add(1);
+            v.ticks.set(t);
+            if t.is_multiple_of(FILE_CHECK_EVERY) {
+                v.check_files();
+            }
             glib::ControlFlow::Continue
         });
         view.refresh();
         view
+    }
+
+    /// Looks, off the main thread, whether each finished job's file is still there, and
+    /// rebuilds the rows whose answer changed.
+    fn check_files(self: &Rc<Self>) {
+        if self.checking.replace(true) {
+            return;
+        }
+        let files: Vec<(Uuid, std::path::PathBuf)> = self.app.downloads.list().into_iter().filter(|j| j.status == Status::Ready).filter_map(|j| Some((j.id, j.path?))).collect();
+        let w = Rc::downgrade(self);
+        app::spawn_bg(
+            async move {
+                let mut out = Vec::with_capacity(files.len());
+                for (id, p) in files {
+                    out.push((id, tokio::fs::try_exists(&p).await.unwrap_or(false)));
+                }
+                out
+            },
+            move |r| {
+                let Some(v) = w.upgrade() else { return };
+                v.checking.set(false);
+                let changed = {
+                    let mut present = v.present.borrow_mut();
+                    r.into_iter().fold(false, |acc, (id, ok)| present.insert(id, ok).is_none_or(|was| was != ok) || acc)
+                };
+                if changed {
+                    v.refresh();
+                }
+            },
+        );
+    }
+
+    /// Whether a finished job's file is known to be where it was saved.
+    fn file_present(&self, id: Uuid) -> bool {
+        self.present.borrow().get(&id).copied().unwrap_or(true)
     }
 
     /// Number of jobs still working, for the tab badge.
@@ -87,7 +152,8 @@ impl DownloadsView {
 
     pub fn refresh(self: &Rc<Self>) {
         let jobs = self.app.downloads.list();
-        let keys: Vec<(Uuid, String)> = jobs.iter().map(|j| (j.id, shape_key(j))).collect();
+        self.present.borrow_mut().retain(|id, _| jobs.iter().any(|j| j.id == *id));
+        let keys: Vec<(Uuid, String)> = jobs.iter().map(|j| (j.id, shape_key(j, self.file_present(j.id)))).collect();
         let same = {
             let rows = self.rows.borrow();
             rows.len() == keys.len() && rows.iter().zip(&keys).all(|((id, k, _), (id2, k2))| id == id2 && k == k2)
@@ -195,6 +261,12 @@ impl DownloadsView {
                     text.append(&l);
                 }
             }
+            // Clips saved with less than was asked for.
+            for (c, w) in j.channels.iter().filter_map(|c| Some((c, c.warning.as_deref()?))) {
+                let label = if zip { format!("{}: {w}", c.name) } else { w.to_string() };
+                let l = gtk::Label::builder().label(label).tooltip_text(w).xalign(0.0).ellipsize(gtk::pango::EllipsizeMode::End).css_classes(["warning", "caption"]).build();
+                text.append(&l);
+            }
             if let Some(err) = &j.error {
                 let l = gtk::Label::builder().label(download::short_reason(err)).tooltip_text(err).xalign(0.0).ellipsize(gtk::pango::EllipsizeMode::End).css_classes(["error", "caption"]).build();
                 text.append(&l);
@@ -207,18 +279,26 @@ impl DownloadsView {
                 text.append(&gtk::Expander::builder().label_widget(&gtk::Label::builder().label(format!("{} files in the zip", j.entries.len())).css_classes(["caption"]).build()).child(&files).halign(gtk::Align::Start).build());
             }
             if let Some(path) = j.path.as_ref().filter(|_| j.status == Status::Ready) {
-                if !path.exists() {
+                if !self.file_present(j.id) {
                     text.append(&gtk::Label::builder().label("The file is no longer there").xalign(0.0).css_classes(["warning", "caption"]).build());
                 } else {
                     if !zip {
                         let play = gtk::Button::builder().icon_name("media-playback-start-symbolic").tooltip_text("Play in the default video player").css_classes(["suggested-action"]).build();
-                        let (a, p) = (self.app.clone(), path.clone());
-                        play.connect_clicked(move |_| launch(&a, &p, false));
+                        let (w, p) = (Rc::downgrade(self), path.clone());
+                        play.connect_clicked(move |_| {
+                            if let Some(v) = w.upgrade() {
+                                launch(&v, &p, false);
+                            }
+                        });
                         buttons.append(&play);
                     }
                     let show = gtk::Button::builder().icon_name("folder-open-symbolic").tooltip_text("Show in folder").build();
-                    let (a, p) = (self.app.clone(), path.clone());
-                    show.connect_clicked(move |_| launch(&a, &p, true));
+                    let (w, p) = (Rc::downgrade(self), path.clone());
+                    show.connect_clicked(move |_| {
+                        if let Some(v) = w.upgrade() {
+                            launch(&v, &p, true);
+                        }
+                    });
                     buttons.append(&show);
                 }
                 text.set_tooltip_text(Some(&path.display().to_string()));
@@ -324,10 +404,9 @@ fn set_text(label: &gtk::Label, s: &str) {
 }
 
 /// What a row is built from, apart from the progress figures `Live` updates in place.
-fn shape_key(j: &JobView) -> String {
-    let chans: Vec<_> = j.channels.iter().map(|c| (c.done, c.error.is_some())).collect();
-    let exists = j.path.as_ref().map(|p| p.exists());
-    format!("{:?}|{:?}|{:?}|{:?}|{:?}|{}|{chans:?}", j.status, j.error, j.path, exists, j.thumb, j.entries.len())
+fn shape_key(j: &JobView, present: bool) -> String {
+    let chans: Vec<_> = j.channels.iter().map(|c| (c.done, c.error.is_some(), c.warning.is_some())).collect();
+    format!("{:?}|{:?}|{:?}|{present}|{:?}|{}|{chans:?}", j.status, j.error, j.path, j.thumb, j.entries.len())
 }
 
 fn fmt_eta(secs: f64) -> String {
@@ -338,21 +417,26 @@ fn fmt_eta(secs: f64) -> String {
     }
 }
 
-/// Opens a saved clip in the default player, or its folder with the file selected.
-fn launch(app: &App, path: &Path, folder: bool) {
+/// Opens a saved clip in the default player, or its folder with the file selected. A failure
+/// is the cue to look again whether the file is still there.
+fn launch(view: &Rc<DownloadsView>, path: &Path, folder: bool) {
     let l = gtk::FileLauncher::new(Some(&gio::File::for_path(path)));
-    let a = app.toasts.clone();
+    let (a, w) = (view.app.toasts.clone(), Rc::downgrade(view));
     let done = move |r: Result<(), glib::Error>| {
         if let Err(e) = r
             && !e.matches(gtk::DialogError::Dismissed)
         {
             a.add_toast(adw::Toast::new(&format!("Could not open: {}", e.message())));
+            if let Some(v) = w.upgrade() {
+                v.check_files();
+            }
         }
     };
+    let window = Some(&view.app.window);
     if folder {
-        l.open_containing_folder(Some(&app.window), gio::Cancellable::NONE, done);
+        l.open_containing_folder(window, gio::Cancellable::NONE, done);
     } else {
-        l.launch(Some(&app.window), gio::Cancellable::NONE, done);
+        l.launch(window, gio::Cancellable::NONE, done);
     }
 }
 

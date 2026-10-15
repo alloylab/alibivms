@@ -5,13 +5,14 @@
 
 use std::{
     cell::{Cell, RefCell},
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     path::PathBuf,
     rc::Rc,
     time::{Duration, Instant, SystemTime},
 };
 
 use anyhow::{Context, bail};
+use futures_util::FutureExt;
 use gst::prelude::*;
 use gtk::{gdk, glib, prelude::*};
 use lapi::Stream;
@@ -29,6 +30,12 @@ const MAX_BACKOFF: Duration = Duration::from_secs(60 * 60);
 const GRAB_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_GRABS: usize = 2;
 const WIDTH: i32 = 160;
+/// A grab still marked running this long after it started has been lost (its task died without
+/// reporting back); the site is freed for the next one.
+const BUSY_LIMIT: Duration = Duration::from_secs(120);
+
+/// A thumbnail widget handed out: its camera, the picture, and the frame around it.
+type Shown = (Cam, glib::WeakRef<gtk::Picture>, glib::WeakRef<gtk::Overlay>);
 
 #[derive(Default)]
 struct Due {
@@ -44,9 +51,9 @@ pub struct Thumbnails {
     textures: RefCell<HashMap<Cam, Option<gdk::Texture>>>,
     due: RefCell<HashMap<Cam, Due>>,
     /// Every thumbnail widget handed out; dead ones are pruned on each tick.
-    pictures: RefCell<Vec<(Cam, glib::WeakRef<gtk::Picture>, glib::WeakRef<gtk::Overlay>)>>,
-    /// Sites with a grab running.
-    busy: RefCell<HashSet<String>>,
+    pictures: RefCell<Vec<Shown>>,
+    /// Sites with a grab running, and when it started.
+    busy: RefCell<HashMap<String, Instant>>,
 }
 
 impl Thumbnails {
@@ -127,6 +134,13 @@ impl Thumbnails {
     /// Starts grabs for on-screen cameras that are due, within the concurrency limits.
     fn tick(self: &Rc<Self>) {
         self.pictures.borrow_mut().retain(|(_, p, _)| p.upgrade().is_some());
+        self.busy.borrow_mut().retain(|site, since| {
+            let lost = since.elapsed() > BUSY_LIMIT;
+            if lost {
+                tracing::warn!(%site, "thumbnail grab never reported back");
+            }
+            !lost
+        });
         if !self.enabled.get() {
             return;
         }
@@ -140,14 +154,14 @@ impl Thumbnails {
             if self.busy.borrow().len() >= MAX_GRABS {
                 return;
             }
-            if self.busy.borrow().contains(&cam.site) || self.due.borrow().get(&cam).and_then(|d| d.at).is_some_and(|at| at > now) {
+            if self.busy.borrow().contains_key(&cam.site) || self.due.borrow().get(&cam).and_then(|d| d.at).is_some_and(|at| at > now) {
                 continue;
             }
             let Some(site) = self.sites.get(&cam.site) else { continue };
             if !site.status().online || !site.channel(cam.channel).is_some_and(|c| c.online) {
                 continue;
             }
-            self.busy.borrow_mut().insert(cam.site.clone());
+            self.busy.borrow_mut().insert(cam.site.clone(), now);
             let ch = cam.channel;
             // Every other retry tries the main stream, for cameras whose sub stream is off.
             let stream = if self.due.borrow().get(&cam).is_some_and(|d| d.failures % 2 == 1) { Stream::Main } else { Stream::Sub };
@@ -157,6 +171,8 @@ impl Thumbnails {
                 let frame = tokio::task::spawn_blocking(move || grab(&media.url, &media.creds.username, &media.creds.password)).await??;
                 anyhow::Ok(frame)
             };
+            // A panic anywhere in there must still reach `done`, or the site stays busy for good.
+            let fetch = std::panic::AssertUnwindSafe(fetch).catch_unwind().map(|r| r.unwrap_or_else(|_| Err(anyhow::anyhow!("thumbnail grab panicked"))));
             let w = Rc::downgrade(self);
             spawn_bg(fetch, move |r| {
                 if let Some(t) = w.upgrade() {
@@ -193,10 +209,8 @@ impl Thumbnails {
             tracing::debug!(path = %path.display(), error = %e, "thumbnail not cached");
         }
         for (c, p, _) in self.pictures.borrow().iter() {
-            if *c == cam {
-                if let Some(p) = p.upgrade() {
-                    p.set_paintable(Some(&tex));
-                }
+            if *c == cam && let Some(p) = p.upgrade() {
+                p.set_paintable(Some(&tex));
             }
         }
         self.textures.borrow_mut().insert(cam, Some(tex));

@@ -26,6 +26,9 @@ pub enum Event {
 
 /// Bus message posted from the streaming thread when an audio track appears.
 const AUDIO_MSG: &str = "alibi-audio";
+/// Bus message posted from the streaming thread when the audio branch could not be attached;
+/// its `reason` field says why.
+const AUDIO_FAILED_MSG: &str = "alibi-audio-failed";
 
 pub struct Player {
     pipeline: gst::Pipeline,
@@ -113,8 +116,7 @@ impl Player {
                 if slot.is_some() {
                     return;
                 }
-                let Ok(park) = gst::ElementFactory::make("fakesink").property("sync", false).property("async", false).build() else { return };
-                if pipeline.add(&park).is_ok() && park.sync_state_with_parent().is_ok() && pad.link(&park.static_pad("sink").unwrap()).is_ok() {
+                if park(&pipeline, pad) {
                     *slot = Some(pad.clone());
                     let _ = src.post_message(gst::message::Application::builder(gst::Structure::new_empty(AUDIO_MSG)).src(src).build());
                 }
@@ -130,11 +132,11 @@ impl Player {
             }
         });
         decode.downcast_ref::<gst::Bin>().expect("decodebin is a bin").connect_deep_element_added(|_, _, el| {
-            if let Some(f) = el.factory() {
-                if f.has_type(gst::ElementFactoryType::DECODER) {
-                    let hw = f.has_type(gst::ElementFactoryType::HARDWARE);
-                    tracing::info!(decoder = %f.name(), hardware = hw, "video decoder chosen");
-                }
+            if let Some(f) = el.factory()
+                && f.has_type(gst::ElementFactoryType::DECODER)
+            {
+                let hw = f.has_type(gst::ElementFactoryType::HARDWARE);
+                tracing::info!(decoder = %f.name(), hardware = hw, "video decoder chosen");
             }
         });
         start_at_keyframe(&decode);
@@ -165,9 +167,17 @@ impl Player {
             match msg.view() {
                 MessageView::Error(e) if from_audio() => {
                     tracing::warn!(error = %e.error(), "audio branch error");
+                    // Forgotten so the next "sound on" builds a fresh branch (the probe in
+                    // `set_audio` swaps out whatever the pad is linked to).
+                    audio2.borrow_mut().take();
                     on_event(Event::AudioFailed(e.error().to_string()));
                 }
                 MessageView::Application(a) if a.structure().is_some_and(|s| s.name() == AUDIO_MSG) => on_event(Event::HasAudio),
+                MessageView::Application(a) if a.structure().is_some_and(|s| s.name() == AUDIO_FAILED_MSG) => {
+                    audio2.borrow_mut().take();
+                    let reason = a.structure().and_then(|s| s.get::<String>("reason").ok()).unwrap_or_else(|| "could not attach audio output".into());
+                    on_event(Event::AudioFailed(reason));
+                }
                 MessageView::Error(e) => {
                     let detail = e.debug().map(|d| d.to_string()).unwrap_or_default();
                     tracing::warn!(error = %e.error(), %detail, "video pipeline error");
@@ -187,7 +197,11 @@ impl Player {
             glib::ControlFlow::Continue
         })?;
 
-        pipeline.set_state(gst::State::Playing).context("starting video")?;
+        if let Err(e) = pipeline.set_state(gst::State::Playing) {
+            // Otherwise the pipeline is dropped while not NULL, which leaks it (and its socket).
+            let _ = pipeline.set_state(gst::State::Null);
+            return Err(e).context("starting video");
+        }
         Ok(Self { pipeline, paintable, queue, codec, audio_pad, audio, frames, _bus: bus })
     }
 
@@ -205,18 +219,26 @@ impl Player {
         let bin = audio_branch()?;
         let volume = bin.by_name("volume").expect("named in audio_branch");
         *self.audio.borrow_mut() = Some((bin.clone(), volume));
-        // Swap the parking fakesink for the branch once no buffer is passing.
+        // Swap the parking fakesink for the branch once no buffer is passing. This runs on the
+        // streaming thread, so a failure is reported through the bus (see `AUDIO_FAILED_MSG`),
+        // which clears `audio` and tells the UI.
         let pipeline = self.pipeline.downgrade();
         pad.add_probe(gst::PadProbeType::IDLE, move |pad, _| {
             let Some(pipeline) = pipeline.upgrade() else { return gst::PadProbeReturn::Remove };
-            if let Some(park) = pad.peer().and_then(|p| p.parent_element()) {
-                let _ = pad.unlink(&park.static_pad("sink").unwrap());
-                let _ = park.set_state(gst::State::Null);
-                let _ = pipeline.remove(&park);
+            if let Some(old) = pad.peer().and_then(|p| p.parent_element()) {
+                let _ = pad.unlink(&old.static_pad("sink").unwrap());
+                let _ = old.set_state(gst::State::Null);
+                let _ = pipeline.remove(&old);
             }
             let linked = pipeline.add(&bin).is_ok() && bin.sync_state_with_parent().is_ok() && pad.link(&bin.static_pad("sink").unwrap()).is_ok();
             if !linked {
                 tracing::warn!("could not attach audio branch");
+                let _ = bin.set_state(gst::State::Null);
+                let _ = pipeline.remove(&bin);
+                // Back on a fakesink: an unlinked pad would stall the whole stream.
+                park(&pipeline, pad);
+                let s = gst::Structure::builder(AUDIO_FAILED_MSG).field("reason", "could not attach audio output").build();
+                let _ = pipeline.post_message(gst::message::Application::builder(s).src(&pipeline).build());
             }
             // The new sink needs the pipeline's latency to play live samples in time.
             let _ = pipeline.recalculate_latency();
@@ -277,6 +299,13 @@ impl Player {
             tracing::warn!(rate, "NVR refused playback speed change");
         }
     }
+}
+
+/// Links `pad` (the camera's audio RTP pad) to a fresh `fakesink`, so the stream keeps flowing
+/// while no sound is wanted. False if that could not be set up.
+fn park(pipeline: &gst::Pipeline, pad: &gst::Pad) -> bool {
+    let Ok(sink) = gst::ElementFactory::make("fakesink").property("sync", false).property("async", false).build() else { return false };
+    pipeline.add(&sink).is_ok() && sink.sync_state_with_parent().is_ok() && pad.link(&sink.static_pad("sink").unwrap()).is_ok()
 }
 
 /// `decodebin` → `audioconvert` → `audioresample` → `volume` → `autoaudiosink`, in one bin
