@@ -656,7 +656,7 @@ impl Tile {
         self.started_at.set(Some(Instant::now()));
         let req = self.request.get();
         let Some(site) = self.app.sites.get(&cam.site) else {
-            self.set_status("Site not connected", true);
+            self.fail("Site not connected", live);
             return;
         };
         self.set_state("", false, true);
@@ -672,7 +672,7 @@ impl Tile {
             }
             let media = match r {
                 Ok(m) => m,
-                Err(e) => return t.set_status(&e, true),
+                Err(e) => return t.fail(&e, live),
             };
             let weak2 = Rc::downgrade(&t);
             let player = Player::new(&media.url, &media.creds, live, move |ev| {
@@ -693,9 +693,18 @@ impl Tile {
                     *t.player.borrow_mut() = Some(p);
                     *t.media.borrow_mut() = Some(media);
                 }
-                Err(e) => t.set_status(&format!("{e:#}"), true),
+                Err(e) => t.fail(&format!("{e:#}"), live),
             }
         });
+    }
+
+    /// Shows a failed start; a live stream tries again after a while, as it does when it drops.
+    fn fail(self: &Rc<Self>, msg: &str, live: bool) {
+        if live {
+            self.restart_live_later(Some(msg));
+        } else {
+            self.set_status(msg, true);
+        }
     }
 
     /// Restarts the live stream of request `req` once frames stop arriving: a camera or relay
@@ -763,12 +772,8 @@ impl Tile {
             Event::Buffering(_) => self.set_status("", false),
             Event::Error(msg) => {
                 self.live_badge.set_visible(false);
-                if live {
-                    // Cameras and NVRs drop streams now and then: retry after a while.
-                    self.restart_live_later(Some(&msg));
-                } else {
-                    self.set_status(&msg, true);
-                }
+                // Cameras and NVRs drop streams now and then: live retries after a while.
+                self.fail(&msg, live);
             }
             Event::HasAudio => {
                 self.audio.set_visible(true);
@@ -899,6 +904,7 @@ impl Tile {
         let speed = gtk::Scale::with_range(gtk::Orientation::Horizontal, 1.0, 9.0, 1.0);
         speed.set_value(5.0);
         speed.set_hexpand(true);
+        let link = PtzLink::new(&self.app, cam);
         let layout = [
             [Some((PtzAction::LeftUp, "↖")), Some((PtzAction::Up, "↑")), Some((PtzAction::RightUp, "↗"))],
             [Some((PtzAction::Left, "←")), None, Some((PtzAction::Right, "→"))],
@@ -907,11 +913,11 @@ impl Tile {
         for (r, row) in layout.iter().enumerate() {
             for (c, cell) in row.iter().enumerate() {
                 let b = match cell {
-                    Some((action, label)) => self.ptz_button(cam, *action, label, &speed),
+                    Some((action, label)) => ptz_button(&link, *action, label, &speed),
                     None => {
                         let stop = gtk::Button::with_label("■");
-                        let (app, cam) = (self.app.clone(), cam.clone());
-                        stop.connect_clicked(move |_| ptz_send(&app, &cam, None, 0));
+                        let link = link.clone();
+                        stop.connect_clicked(move |_| link.stop_all());
                         stop
                     }
                 };
@@ -920,7 +926,7 @@ impl Tile {
         }
         let side = gtk::Box::new(gtk::Orientation::Vertical, 4);
         for (action, label) in [(PtzAction::ZoomIn, "Zoom +"), (PtzAction::ZoomOut, "Zoom −"), (PtzAction::FocusNear, "Focus near"), (PtzAction::FocusFar, "Focus far")] {
-            side.append(&self.ptz_button(cam, action, label, &speed));
+            side.append(&ptz_button(&link, action, label, &speed));
         }
         let presets = gtk::DropDown::from_strings(&["Presets…"]);
         let preset_ids: Rc<RefCell<Vec<u32>>> = Rc::default();
@@ -971,47 +977,123 @@ impl Tile {
         body.set_margin_bottom(6);
         body.set_margin_start(6);
         body.set_margin_end(6);
-        gtk::Popover::builder().child(&body).build()
-    }
-
-    /// A button that moves while held and stops on release.
-    fn ptz_button(&self, cam: &Cam, action: PtzAction, label: &str, speed: &gtk::Scale) -> gtk::Button {
-        let b = gtk::Button::with_label(label);
-        let press = gtk::GestureClick::new();
-        {
-            let (app, cam, speed) = (self.app.clone(), cam.clone(), speed.clone());
-            press.connect_pressed(move |_, _, _, _| ptz_send(&app, &cam, Some((action, false)), speed.value() as u8));
-        }
-        {
-            let (app, cam) = (self.app.clone(), cam.clone());
-            press.connect_released(move |_, _, _, _| ptz_send(&app, &cam, Some((action, true)), 0));
-        }
-        {
-            let (app, cam) = (self.app.clone(), cam.clone());
-            press.connect_cancel(move |_, _| ptz_send(&app, &cam, Some((action, true)), 0));
-        }
-        b.add_controller(press);
-        b
+        let popover = gtk::Popover::builder().child(&body).build();
+        // A motion still held when the popover goes away must not run on.
+        popover.connect_closed(move |_| link.release());
+        popover
     }
 }
 
-/// `None` stops everything; `Some((action, true))` stops that action.
-fn ptz_send(app: &Rc<App>, cam: &Cam, action: Option<(PtzAction, bool)>, speed: u8) {
-    let Some(site) = app.sites.get(&cam.site) else { return };
-    let ch = cam.channel;
-    let app = app.clone();
-    spawn_bg(
-        async move {
-            match action {
-                Some((a, false)) => site.client.ptz_start(ch, a, speed).await,
-                Some((a, true)) => site.client.ptz_stop(ch, Some(a)).await,
-                None => site.client.ptz_stop(ch, None).await,
+/// A button that moves while held and stops on release.
+fn ptz_button(link: &Rc<PtzLink>, action: PtzAction, label: &str, speed: &gtk::Scale) -> gtk::Button {
+    let b = gtk::Button::with_label(label);
+    // Ahead of the button's own click gesture, which would otherwise claim the press and leave
+    // this one without its release.
+    let press = gtk::GestureClick::builder().propagation_phase(gtk::PropagationPhase::Capture).build();
+    {
+        let (link, speed, b) = (link.clone(), speed.clone(), b.clone());
+        press.connect_pressed(move |g, _, _, _| {
+            g.set_state(gtk::EventSequenceState::Claimed);
+            b.set_state_flags(gtk::StateFlags::ACTIVE, false);
+            link.start(action, speed.value() as u8);
+        });
+    }
+    {
+        let (link, b) = (link.clone(), b.clone());
+        press.connect_released(move |_, _, _, _| {
+            b.unset_state_flags(gtk::StateFlags::ACTIVE);
+            link.release();
+        });
+    }
+    {
+        let (link, b) = (link.clone(), b.clone());
+        press.connect_cancel(move |_, _| {
+            b.unset_state_flags(gtk::StateFlags::ACTIVE);
+            link.release();
+        });
+    }
+    b.add_controller(press);
+    b
+}
+
+enum PtzCmd {
+    Start(PtzAction, u8),
+    /// `None` stops everything.
+    Stop(Option<PtzAction>),
+}
+
+/// One camera's PTZ commands, sent one at a time in the order given: sent independently, a quick
+/// tap's stop could reach the NVR before its start and leave the camera moving.
+struct PtzLink {
+    app: Rc<App>,
+    cam: Cam,
+    tx: tokio::sync::mpsc::UnboundedSender<(std::sync::Arc<crate::sites::Site>, PtzCmd)>,
+    /// The motion currently held.
+    moving: Cell<Option<PtzAction>>,
+    /// The last motion started, which the stop button ends.
+    last: Cell<Option<PtzAction>>,
+}
+
+impl PtzLink {
+    fn new(app: &Rc<App>, cam: &Cam) -> Rc<Self> {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(std::sync::Arc<crate::sites::Site>, PtzCmd)>();
+        let (err_tx, mut err_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let ch = cam.channel;
+        app::rt().spawn(async move {
+            while let Some((site, cmd)) = rx.recv().await {
+                let r = match cmd {
+                    PtzCmd::Start(a, speed) => site.client.ptz_start(ch, a, speed).await,
+                    PtzCmd::Stop(a) => {
+                        // A lost stop leaves the camera moving: try it a few times.
+                        let mut r = site.client.ptz_stop(ch, a).await;
+                        for _ in 0..2 {
+                            if r.is_ok() {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(300)).await;
+                            r = site.client.ptz_stop(ch, a).await;
+                        }
+                        r
+                    }
+                };
+                if let Err(e) = r {
+                    tracing::warn!(channel = ch, error = %e, "PTZ command failed");
+                    let _ = err_tx.send(e.to_string());
+                }
             }
-        },
-        move |r| {
-            if let Err(e) = r {
-                app.toast(format!("PTZ: {e}"));
+        });
+        let app2 = app.clone();
+        glib::spawn_future_local(async move {
+            while let Some(e) = err_rx.recv().await {
+                app2.toast(format!("PTZ: {e}"));
             }
-        },
-    );
+        });
+        Rc::new(Self { app: app.clone(), cam: cam.clone(), tx, moving: Cell::default(), last: Cell::default() })
+    }
+
+    fn send(&self, cmd: PtzCmd) {
+        if let Some(site) = self.app.sites.get(&self.cam.site) {
+            let _ = self.tx.send((site, cmd));
+        }
+    }
+
+    fn start(&self, action: PtzAction, speed: u8) {
+        self.moving.set(Some(action));
+        self.last.set(Some(action));
+        self.send(PtzCmd::Start(action, speed));
+    }
+
+    /// Stops the held motion, if any.
+    fn release(&self) {
+        if let Some(a) = self.moving.take() {
+            self.send(PtzCmd::Stop(Some(a)));
+        }
+    }
+
+    /// Stops the last motion with its own stop code, the same one a release sends; the NVR's
+    /// all-stop, which can leave PTZ unresponsive, is only the fallback before anything moved.
+    fn stop_all(&self) {
+        self.moving.set(None);
+        self.send(PtzCmd::Stop(self.last.get()));
+    }
 }
