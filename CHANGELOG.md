@@ -3,6 +3,16 @@
 All notable changes to Alibi VMS. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.1.5] - 2026-10-21
+
+### Fixed
+- PTZ controls could stop responding, or leave a camera moving after its button was let go. Each
+  camera's PTZ commands are now sent in order, a lost stop is retried, the stop button ends the
+  last motion, and closing the PTZ panel stops any motion still held.
+- A live camera that failed to start, such as when its site was not connected or the stream could
+  not be opened, showed an error and gave up. It now tries again after a while, as it does when a
+  stream drops.
+
 ## [0.1.4] - 2026-10-14
 
 ### Fixed
@@ -72,6 +82,7 @@ First public release.
 - Packages for Linux (Flatpak, AppImage), Windows (installer) and macOS (DMG), for x86_64 and ARM64.
 - Licensed under the Elastic License 2.0.
 
+[0.1.5]: https://github.com/alloylab/alibivms/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/alloylab/alibivms/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/alloylab/alibivms/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/alloylab/alibivms/compare/v0.1.1...v0.1.2
