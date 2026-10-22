@@ -67,6 +67,9 @@ sed -i '/^export GTK_THEME=/d; /^export GDK_BACKEND=/d' "$appdir/apprun-hooks/li
 cat > "$appdir/apprun-hooks/alibivms.sh" <<'EOF'
 export GST_REGISTRY_1_0="${XDG_CACHE_HOME:-$HOME/.cache}/alibivms/gst-registry-$(uname -m).bin"
 EOF
+# The version launchers like Gear Lever show; the plugin would only add it from VERSION, which
+# it does not get below.
+echo "X-AppImage-Version=$VERSION" >> "$appdir/usr/share/applications/$APP_ID.desktop"
 
 # Update information, so AppImageUpdate and launchers like Gear Lever or AppImageLauncher can
 # update in place from the latest GitHub release. Also writes the .zsync file they read, which
