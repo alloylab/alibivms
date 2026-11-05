@@ -248,10 +248,13 @@ impl Account {
             channel_list: Vec<C>,
         }
         const PAGE: usize = 100;
+        // `queryType` 1 is what the portal's camera tree asks for, and it never sends 0, which
+        // can also list channels removed from the NVR's camera list as offline channels.
+        const BOUND_CHANNELS: u8 = 1;
         let mut out: Vec<CloudChannel> = Vec::new();
         let mut start = 0;
         loop {
-            let body = json!({ "deviceSerial": serial, "queryType": 0, "pageStart": start, "pageSize": PAGE });
+            let body = json!({ "deviceSerial": serial, "queryType": BOUND_CHANNELS, "pageStart": start, "pageSize": PAGE });
             let p: Page = self.call_as("/openapi/inner/device/channel/list", &body).await?;
             let n = p.channel_list.len();
             for c in &p.channel_list {

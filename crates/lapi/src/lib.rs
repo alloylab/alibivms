@@ -559,8 +559,45 @@ impl Client {
         Ok(self.call::<D>(Method::GET, "/LAPI/V1.0/Channels/System/DeviceInfos", None).await?.infos)
     }
 
-    /// Channel list with online state, via the legacy CGI (cmd 26) the web UI uses.
+    /// Channel slots with no camera bound to them, that is, channels removed from the NVR's camera list.
+    /// The NVR still lists such a slot as an offline resource, so its camera page drops every
+    /// slot whose `Status` is idle (2; 0 offline, 1 online) from `Channels/System/ChannelDetailInfos`.
+    pub async fn idle_channels(&self) -> Result<Vec<u32>> {
+        #[derive(Deserialize)]
+        struct Info {
+            #[serde(rename = "ID")]
+            id: u32,
+            #[serde(rename = "Status", default)]
+            status: u8,
+        }
+        #[derive(Deserialize)]
+        struct D {
+            #[serde(rename = "DetailInfos", default)]
+            infos: Vec<Info>,
+        }
+        const IDLE: u8 = 2;
+        let d: D = self.call(Method::GET, "/LAPI/V1.0/Channels/System/ChannelDetailInfos", None).await?;
+        let idle: Vec<u32> = d.infos.into_iter().filter(|i| i.status == IDLE).map(|i| i.id).collect();
+        tracing::debug!(host = self.host(), ?idle, "idle channel slots");
+        Ok(idle)
+    }
+
+    /// Channel list with online state. Idle slots (see [`Client::idle_channels`]) are left out:
+    /// they are not cameras, only places for one. Offline cameras stay.
     pub async fn channels(&self) -> Result<Vec<Channel>> {
+        let mut out = self.all_channels().await?;
+        // An NVR without this call, or one that refuses it, keeps every slot rather than
+        // losing the list.
+        match self.idle_channels().await {
+            Ok(idle) => out.retain(|c| !idle.contains(&c.id)),
+            Err(e) => tracing::debug!(host = self.host(), error = %e, "no channel detail infos; keeping idle slots"),
+        }
+        Ok(out)
+    }
+
+    /// Every channel slot the NVR reports, via the legacy CGI (cmd 26) the web UI uses, or the
+    /// Star4Live channel list for a cloud site.
+    async fn all_channels(&self) -> Result<Vec<Channel>> {
         if let Some((account, serial)) = &self.cloud {
             return Ok(account
                 .channels(serial)
