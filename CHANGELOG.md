@@ -3,6 +3,15 @@
 All notable changes to Alibi VMS. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.1.6] - 2026-11-05
+
+### Fixed
+- A camera removed from an NVR's camera list kept showing in the app as an offline camera. Such
+  channels are now left out, both for NVRs reached directly and for those reached through
+  Star4Live. A camera still on the list but unreachable shows as offline, as before.
+- The AppImage now carries its version where launchers such as Gear Lever look for it. This was
+  meant to be in 0.1.5 but the tag was cut before the change.
+
 ## [0.1.5] - 2026-10-21
 
 ### Fixed

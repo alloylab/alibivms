@@ -28,6 +28,11 @@
     <control>keyboard</control>
   </supports>
   <releases>
+    <release version="0.1.6" date="2026-11-05">
+      <description>
+        <p>Cameras removed from an NVR no longer show up as offline cameras. The AppImage now reports its version to launchers such as Gear Lever.</p>
+      </description>
+    </release>
     <release version="0.1.5" date="2026-10-21">
       <description>
         <p>PTZ controls no longer stop responding or leave a camera moving after a button is let go. Live cameras that fail to start now try again by themselves.</p>
